@@ -1,0 +1,7 @@
+.env
+.venv/
+.multi-agent-lab/
+__pycache__/
+*.pyc
+*.egg-info/
+

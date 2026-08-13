@@ -1,0 +1,89 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sys
+from pathlib import Path
+
+from .workflow import CollaborationWorkflow, WorkflowInterrupted
+
+
+def _print_runs(workflow: CollaborationWorkflow) -> None:
+    rows = workflow.store.list_runs()
+    if not rows:
+        print("No runs found.")
+        return
+    print(f"{'RUN ID':12}  {'STATUS':9}  OBJECTIVE")
+    for row in rows:
+        print(f"{row['run_id']:12}  {row['status']:9}  {row['objective']}")
+
+
+def _show_run(workflow: CollaborationWorkflow, run_id: str) -> None:
+    run, artifacts, events = workflow.store.run_details(run_id)
+    print(f"Run: {run['run_id']}")
+    print(f"Status: {run['status']}")
+    print(f"Created: {run['created_at']}")
+    print(f"Completed: {run['completed_at'] or '-'}")
+    print(f"Objective: {run['objective']}")
+    print("\nArtifacts:")
+    if not artifacts:
+        print("  None")
+    for artifact in artifacts:
+        print(f"  {artifact['stage']}/{artifact['author']}  {artifact['artifact_id']}  {artifact['path']}")
+    print("\nEvents:")
+    if not events:
+        print("  None")
+    for event in events:
+        actor = f"/{event['agent_id']}" if event["agent_id"] else ""
+        payload = json.loads(event["payload_json"])
+        detail = f" {json.dumps(payload, sort_keys=True)}" if payload else ""
+        print(f"  {event['created_at']}  {event['stage']}{actor}  {event['event_type']}{detail}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run a controlled multi-agent collaboration")
+    parser.add_argument("objective", nargs="?", help="The topic or deliverable to work on")
+    parser.add_argument("--workspace", type=Path, default=Path(".multi-agent-lab"))
+    parser.add_argument("--resume", metavar="RUN_ID", help="Resume a failed run, executing only missing stages")
+    parser.add_argument("--list-runs", action="store_true", help="List runs in the workspace")
+    parser.add_argument("--show-run", metavar="RUN_ID", help="Show a run's artifacts and audit events")
+    args = parser.parse_args()
+
+    selected = sum((bool(args.objective), bool(args.resume), args.list_runs, bool(args.show_run)))
+    if selected != 1:
+        parser.error("provide exactly one of an objective, --resume RUN_ID, --list-runs, or --show-run RUN_ID")
+
+    try:
+        workflow = CollaborationWorkflow(args.workspace, progress=lambda message: print(message, file=sys.stderr, flush=True))
+        if args.list_runs:
+            _print_runs(workflow)
+            return
+        if args.show_run:
+            _show_run(workflow, args.show_run)
+            return
+        result = asyncio.run(workflow.run(args.objective, resume_id=args.resume))
+    except WorkflowInterrupted as exc:
+        print(f"\nRun {exc.run_id} was interrupted; completed artifacts were preserved.")
+        print(
+            "Resume with: "
+            f"PYTHONPATH=src python3 -m multi_agent_lab.cli "
+            f"--workspace {args.workspace} --resume {exc.run_id}"
+        )
+        raise SystemExit(130) from None
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        if args.resume:
+            print(
+                "Resume with: "
+                f"PYTHONPATH=src python3 -m multi_agent_lab.cli "
+                f"--workspace {args.workspace} --resume {args.resume}",
+                file=sys.stderr,
+            )
+        raise SystemExit(1) from None
+    print(f"Run: {result.run_id}")
+    print(f"Final artifact: {result.final_artifact.path}")
+
+
+if __name__ == "__main__":
+    main()
