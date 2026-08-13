@@ -10,6 +10,7 @@ from unittest.mock import patch
 from multi_agent_lab.models import AgentSpec
 from multi_agent_lab.providers import AnthropicProvider, MockProvider
 from multi_agent_lab.workflow import CollaborationWorkflow, WorkflowInterrupted
+from multi_agent_lab.validation import OutputValidationError, validate_output
 
 
 class WorkflowTest(unittest.TestCase):
@@ -193,8 +194,20 @@ class WorkflowTest(unittest.TestCase):
 
             async def produce_large_artifacts(provider, agent, prompt):
                 nonlocal reviewer_prompt
-                if agent.role in {"producer", "critic"}:
-                    return f"START-{agent.agent_id}-" + (agent.agent_id * 300) + f"-END-{agent.agent_id}"
+                large_text = f"START-{agent.agent_id}-" + (agent.agent_id * 300) + f"-END-{agent.agent_id}"
+                if agent.role == "producer":
+                    return json.dumps({
+                        "proposal": large_text,
+                        "assumptions": [],
+                        "risks": [],
+                        "confidence": 0.5,
+                    })
+                if agent.role == "critic":
+                    return json.dumps({
+                        "findings": [large_text],
+                        "recommendation": "revise",
+                        "confidence": 0.5,
+                    })
                 reviewer_prompt = prompt
                 return await original_complete(provider, agent, prompt)
 
@@ -226,6 +239,65 @@ class WorkflowTest(unittest.TestCase):
             result, compacted = workflow._build_judge_input(sections)
             self.assertFalse(compacted)
             self.assertEqual(result, "ONE:\nalpha\n\nTWO:\nomega")
+
+    def test_malformed_output_is_repaired_once_and_audited(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict("os.environ", {"AGENT_PROVIDER": "mock"}):
+            workspace = Path(folder)
+            workflow = CollaborationWorkflow(workspace)
+            original_complete = MockProvider.complete
+            malformed_once = True
+
+            async def malformed_then_repaired(provider, agent, prompt):
+                nonlocal malformed_once
+                if agent.agent_id == "producer-a" and malformed_once:
+                    malformed_once = False
+                    return "not json"
+                return await original_complete(provider, agent, prompt)
+
+            with patch.object(MockProvider, "complete", malformed_then_repaired):
+                result = asyncio.run(workflow.run("Repair malformed output"))
+
+            with closing(sqlite3.connect(workspace / "runs.db")) as db:
+                events = [row[0] for row in db.execute(
+                    "SELECT event_type FROM events WHERE run_id = ? AND agent_id = 'producer-a'",
+                    (result.run_id,),
+                )]
+            self.assertIn("output_repairing", events)
+            self.assertIn("output_repaired", events)
+
+    def test_invalid_repair_fails_without_writing_artifact(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict("os.environ", {"AGENT_PROVIDER": "mock"}):
+            workspace = Path(folder)
+            workflow = CollaborationWorkflow(workspace)
+
+            async def always_invalid(provider, agent, prompt):
+                return "still not json"
+
+            with patch.object(MockProvider, "complete", always_invalid):
+                with self.assertRaisesRegex(OutputValidationError, "after one repair"):
+                    asyncio.run(workflow.run("Reject invalid repair"))
+
+            with closing(sqlite3.connect(workspace / "runs.db")) as db:
+                artifact_count = db.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0]
+                repair_failures = db.execute(
+                    "SELECT COUNT(*) FROM events WHERE event_type = 'output_repair_failed'"
+                ).fetchone()[0]
+            self.assertEqual(artifact_count, 0)
+            self.assertEqual(repair_failures, 2)
+
+    def test_validation_accepts_fenced_json_and_normalizes_it(self):
+        output = validate_output(
+            "critic",
+            '```json\n{"findings": [], "recommendation": "approve", "confidence": 1}\n```',
+        )
+        self.assertEqual(json.loads(output)["recommendation"], "approve")
+
+    def test_validation_rejects_wrong_schema(self):
+        with self.assertRaisesRegex(OutputValidationError, "confidence"):
+            validate_output(
+                "reviewer",
+                '{"decision":"merge","final":"x","unresolved_questions":[],"confidence":2}',
+            )
 
 
 if __name__ == "__main__":

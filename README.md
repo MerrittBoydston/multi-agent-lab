@@ -62,6 +62,8 @@ Anthropic responses use streaming so long generations continue sending data inst
 
 Reviewer inputs are capped at 16,000 characters by default. If proposals and critiques exceed that budget, the workflow preserves the beginning and end of every section and records a `reviewer_input_compacted` audit event with the original and compacted sizes. Set `REVIEWER_MAX_INPUT_CHARS` to change the budget (minimum 1,000).
 
+Every agent response is validated as JSON against its role contract before it becomes an artifact. Malformed output receives one bounded repair attempt. Repair attempts and outcomes are recorded as `output_repairing`, `output_repaired`, or `output_repair_failed` events; a second invalid response fails the run without saving it.
+
 ## Step 2 — connect one real provider
 
 Create and activate a virtual environment, then install one adapter:
@@ -128,9 +130,8 @@ Model names change. Use models currently enabled for your provider accounts.
 
 Once the local workflow is useful, add in this order:
 
-1. JSON Schema validation and one bounded repair attempt for malformed model output.
-2. A human approval state before external actions.
-3. OpenTelemetry-compatible traces and token/cost accounting.
-4. A remote-agent adapter using an A2A-style task and artifact contract.
-5. A durable workflow runtime only when runs need to survive process restarts.
-6. MCP servers for narrowly permissioned tools and shared data.
+1. A human approval state before external actions.
+2. OpenTelemetry-compatible traces and token/cost accounting.
+3. A remote-agent adapter using an A2A-style task and artifact contract.
+4. A durable workflow runtime only when runs need to survive process restarts.
+5. MCP servers for narrowly permissioned tools and shared data.

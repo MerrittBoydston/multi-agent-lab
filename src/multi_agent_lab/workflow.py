@@ -9,6 +9,7 @@ from typing import Callable
 from .models import AgentSpec, Artifact
 from .providers import bounded_completion, provider_for
 from .store import RunStore
+from .validation import OutputValidationError, validate_output
 
 
 PRODUCER_PROMPT = """You are an independent solution producer. Do not assume other agents agree with you.
@@ -85,6 +86,31 @@ class CollaborationWorkflow:
                     f"in {delay:g}s ({type(exc).__name__})"
                 )
                 await asyncio.sleep(delay)
+        try:
+            result = validate_output(agent.role, result)
+        except OutputValidationError as exc:
+            self.store.event(run_id, stage, "output_repairing", {"error": str(exc)}, agent.agent_id)
+            self.progress(f"[{run_id}] {stage}: repairing malformed output from {agent.agent_id}")
+            repair_prompt = (
+                f"Your previous response failed validation: {exc}.\n"
+                "Return only a corrected JSON object matching your required schema. "
+                "Do not use Markdown fences. Preserve the substance of the response.\n\n"
+                f"PREVIOUS RESPONSE:\n{result}"
+            )
+            repaired = await bounded_completion(
+                provider_for(agent.provider), agent, repair_prompt,
+                timeout_seconds=self.timeout, max_output_chars=self.max_output,
+            )
+            try:
+                result = validate_output(agent.role, repaired)
+            except OutputValidationError as repair_exc:
+                self.store.event(
+                    run_id, stage, "output_repair_failed", {"error": str(repair_exc)}, agent.agent_id
+                )
+                raise OutputValidationError(
+                    f"{agent.agent_id} returned invalid output after one repair: {repair_exc}"
+                ) from repair_exc
+            self.store.event(run_id, stage, "output_repaired", {}, agent.agent_id)
         artifact = self.store.artifact(run_id, stage, agent.agent_id, result)
         self.store.event(run_id, stage, "agent_completed", {"artifact_id": artifact.artifact_id}, agent.agent_id)
         self.progress(f"[{run_id}] {stage}: completed {agent.agent_id}")
