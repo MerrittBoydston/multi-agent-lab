@@ -8,6 +8,7 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+from .config import WorkflowConfig, load_config
 from .workflow import CollaborationWorkflow, WorkflowInterrupted
 
 
@@ -54,6 +55,7 @@ def _show_run(workflow: CollaborationWorkflow, run_id: str) -> None:
     print(f"Created: {run['created_at']}")
     print(f"Completed: {run['completed_at'] or '-'}")
     print(f"Objective: {run['objective']}")
+    print(f"Configuration: {'stored snapshot' if run['config_json'] else 'legacy default'}")
     if completed_metrics:
         duration = sum(item["duration_seconds"] for item in completed_metrics)
         retries = sum(item["retries"] for item in completed_metrics)
@@ -108,21 +110,29 @@ def _show_run(workflow: CollaborationWorkflow, run_id: str) -> None:
         print(f"  {event['created_at']}  {event['stage']}{actor}  {event['event_type']}{detail}")
 
 
-def _print_resume_plan(workflow: CollaborationWorkflow, run_id: str) -> None:
-    reused, missing = workflow.resume_plan(run_id)
+def _print_resume_plan(
+    workflow: CollaborationWorkflow,
+    run_id: str,
+    config: WorkflowConfig | None = None,
+) -> None:
+    reused, missing = workflow.resume_plan(run_id, config)
     format_slots = lambda slots: ", ".join(f"{stage}/{agent}" for stage, agent in slots) or "none"
     print(f"Resume plan for {run_id}:", file=sys.stderr)
     print(f"  Reuse: {format_slots(reused)}", file=sys.stderr)
     print(f"  Execute: {format_slots(missing)}", file=sys.stderr)
 
 
-async def _resume_many(workflow: CollaborationWorkflow, run_ids: list[str]) -> list[WorkflowResult]:
+async def _resume_many(
+    workflow: CollaborationWorkflow,
+    run_ids: list[str],
+    config: WorkflowConfig | None = None,
+) -> list[WorkflowResult]:
     results = []
     failures = []
     for run_id in run_ids:
-        _print_resume_plan(workflow, run_id)
+        _print_resume_plan(workflow, run_id, config)
         try:
-            results.append(await workflow.run(resume_id=run_id))
+            results.append(await workflow.run(resume_id=run_id, config=config))
         except WorkflowInterrupted:
             raise
         except Exception as exc:
@@ -138,6 +148,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run a controlled multi-agent collaboration")
     parser.add_argument("objective", nargs="?", help="The topic or deliverable to work on")
     parser.add_argument("--workspace", type=Path, default=Path(".multi-agent-lab"))
+    parser.add_argument("--config", type=Path, help="YAML workflow configuration for a new run or resume verification")
     parser.add_argument("--resume", metavar="RUN_ID", help="Resume a failed run, executing only missing stages")
     parser.add_argument("--resume-latest", action="store_true", help="Resume the newest failed run")
     parser.add_argument("--retry-failed", action="store_true", help="Resume all failed runs, oldest first")
@@ -154,9 +165,12 @@ def main() -> None:
             "provide exactly one of an objective, --resume RUN_ID, --resume-latest, "
             "--retry-failed, --list-runs, or --show-run RUN_ID"
         )
+    if args.config and (args.list_runs or args.show_run):
+        parser.error("--config can only be used when starting or resuming runs")
 
     try:
         workflow = CollaborationWorkflow(args.workspace, progress=lambda message: print(message, file=sys.stderr, flush=True))
+        config = load_config(args.config) if args.config else None
         if args.list_runs:
             _print_runs(workflow)
             return
@@ -173,14 +187,14 @@ def main() -> None:
             if not failed:
                 print("No failed runs found.")
                 return
-            results = asyncio.run(_resume_many(workflow, failed))
+            results = asyncio.run(_resume_many(workflow, failed, config))
             for result in results:
                 print(f"Run: {result.run_id}")
                 print(f"Final artifact: {result.final_artifact.path}")
             return
         if args.resume:
-            _print_resume_plan(workflow, args.resume)
-        result = asyncio.run(workflow.run(args.objective, resume_id=args.resume))
+            _print_resume_plan(workflow, args.resume, config)
+        result = asyncio.run(workflow.run(args.objective, resume_id=args.resume, config=config))
     except WorkflowInterrupted as exc:
         print(f"\nRun {exc.run_id} was interrupted; completed artifacts were preserved.")
         print(

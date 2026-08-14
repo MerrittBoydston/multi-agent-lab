@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
 import re
 import time
@@ -8,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from .config import OBJECTIVE_PATTERN, REFERENCE_PATTERN, WorkflowConfig, config_from_mapping
 from .models import AgentSpec, Artifact
 from .providers import bounded_completion, provider_for
 from .store import RunStore
@@ -20,15 +22,6 @@ CRITIC_PROMPT = """You are an adversarial reviewer. Evaluate the candidate again
 Return JSON with: findings[], recommendation (approve|revise|reject), confidence (0..1)."""
 JUDGE_PROMPT = """You are an impartial synthesizer. Preserve important disagreements rather than forcing consensus.
 Return JSON with: decision, final, unresolved_questions[], confidence (0..1)."""
-
-ARTIFACT_SLOTS = (
-    ("proposal", "producer-a"),
-    ("proposal", "producer-b"),
-    ("critique", "critic-a"),
-    ("critique", "critic-b"),
-    ("final", "reviewer"),
-)
-
 
 @dataclass(frozen=True)
 class WorkflowResult:
@@ -54,16 +47,103 @@ class CollaborationWorkflow:
         if self.reviewer_input_limit < 1000:
             raise ValueError("REVIEWER_MAX_INPUT_CHARS must be at least 1000")
 
-    def resume_plan(self, run_id: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    def resume_plan(
+        self, run_id: str, requested_config: WorkflowConfig | None = None
+    ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
         run, _, _ = self.store.run_details(run_id)
         if run["status"] == "completed":
             raise ValueError(f"Run {run_id!r} is already completed")
         if run["status"] != "failed":
             raise ValueError(f"Run {run_id!r} is {run['status']!r}, not failed")
+        config = self._config_for_run(run, requested_config)
         completed = self.store.artifacts_for_run(run_id)
-        reused = [slot for slot in ARTIFACT_SLOTS if slot in completed]
-        missing = [slot for slot in ARTIFACT_SLOTS if slot not in completed]
+        reused = [slot for slot in config.slots if slot in completed]
+        missing = [slot for slot in config.slots if slot not in completed]
         return reused, missing
+
+    def _default_config(self) -> WorkflowConfig:
+        agents = {
+            "producer-a": self._agent("producer-a", "producer", PRODUCER_PROMPT),
+            "producer-b": self._agent("producer-b", "producer", PRODUCER_PROMPT),
+            "critic-a": self._agent("critic-a", "critic", CRITIC_PROMPT),
+            "critic-b": self._agent("critic-b", "critic", CRITIC_PROMPT),
+            "reviewer": self._agent("reviewer", "reviewer", JUDGE_PROMPT),
+        }
+
+        def configured(agent_id: str, input_template: str) -> dict:
+            agent = agents[agent_id]
+            return {
+                "id": agent.agent_id,
+                "role": agent.role,
+                "provider": agent.provider,
+                "model": agent.model,
+                "system_prompt": agent.system_prompt,
+                "input": input_template,
+            }
+
+        return config_from_mapping({
+            "version": 1,
+            "stages": [
+                {
+                    "id": "proposal",
+                    "agents": [
+                        configured("producer-a", "{{ objective }}"),
+                        configured("producer-b", "{{ objective }}"),
+                    ],
+                },
+                {
+                    "id": "critique",
+                    "agents": [
+                        configured(
+                            "critic-a",
+                            "OBJECTIVE:\n{{ objective }}\n\nCANDIDATE B:\n"
+                            "{{ artifact.proposal.producer-b }}",
+                        ),
+                        configured(
+                            "critic-b",
+                            "OBJECTIVE:\n{{ objective }}\n\nCANDIDATE A:\n"
+                            "{{ artifact.proposal.producer-a }}",
+                        ),
+                    ],
+                },
+                {
+                    "id": "final",
+                    "agents": [configured(
+                        "reviewer",
+                        "OBJECTIVE:\n{{ objective }}\n\n"
+                        "PROPOSAL A:\n{{ artifact.proposal.producer-a }}\n\n"
+                        "PROPOSAL B:\n{{ artifact.proposal.producer-b }}\n\n"
+                        "CRITIQUE OF B:\n{{ artifact.critique.critic-a }}\n\n"
+                        "CRITIQUE OF A:\n{{ artifact.critique.critic-b }}",
+                    )],
+                },
+            ],
+        })
+
+    def _config_for_run(self, run, requested_config: WorkflowConfig | None) -> WorkflowConfig:
+        stored_json = run["config_json"]
+        stored = WorkflowConfig.from_json(stored_json) if stored_json else self._default_config()
+        if requested_config is not None and requested_config.to_json() != stored.to_json():
+            raise ValueError("Supplied configuration does not match the run's stored configuration snapshot")
+        return stored
+
+    @staticmethod
+    def _validate_runtime_config(config: WorkflowConfig) -> None:
+        requirements = {
+            "anthropic": ("anthropic", "ANTHROPIC_API_KEY"),
+            "openai": ("openai", "OPENAI_API_KEY"),
+        }
+        providers = {agent.provider for stage in config.stages for agent in stage.agents}
+        for provider in sorted(providers):
+            if provider == "mock":
+                continue
+            package, key_name = requirements[provider]
+            if importlib.util.find_spec(package) is None:
+                raise ValueError(
+                    f"Configuration requires provider {provider!r}; install the {provider} package extra"
+                )
+            if not os.getenv(key_name):
+                raise ValueError(f"Configuration requires environment variable {key_name}")
 
     def _agent(self, agent_id: str, role: str, prompt: str) -> AgentSpec:
         prefix = agent_id.upper().replace("-", "_")
@@ -254,28 +334,93 @@ class CollaborationWorkflow:
         ])
         return compacted, True
 
-    async def run(self, objective: str | None = None, *, resume_id: str | None = None) -> WorkflowResult:
+    def _render_input(
+        self,
+        template: str,
+        objective: str,
+        completed: dict[tuple[str, str], Artifact],
+        *,
+        compact: bool,
+    ) -> tuple[str, bool, int]:
+        token_pattern = re.compile(
+            rf"{OBJECTIVE_PATTERN.pattern}|{REFERENCE_PATTERN.pattern}"
+        )
+        matches = list(token_pattern.finditer(template))
+        values = []
+        for match in matches:
+            if OBJECTIVE_PATTERN.fullmatch(match.group(0)):
+                values.append(objective)
+            else:
+                reference = REFERENCE_PATTERN.fullmatch(match.group(0))
+                slot = (reference.group(1), reference.group(2))
+                artifact = completed.get(slot)
+                if artifact is None:
+                    raise ValueError(f"Missing required artifact {slot[0]}/{slot[1]}")
+                values.append(Path(artifact.path).read_text(encoding="utf-8"))
+
+        def render(replacements: list[str]) -> str:
+            pieces = []
+            position = 0
+            for match, replacement in zip(matches, replacements):
+                pieces.extend((template[position:match.start()], replacement))
+                position = match.end()
+            pieces.append(template[position:])
+            return "".join(pieces)
+
+        original = render(values)
+        if not compact or len(original) <= self.reviewer_input_limit:
+            return original, False, len(original)
+        fixed_chars = len(render(["" for _ in values]))
+        available = max(0, self.reviewer_input_limit - fixed_chars)
+        allocations = [0] * len(values)
+        active = set(range(len(values)))
+        while active:
+            share, remainder = divmod(available, len(active))
+            satisfied = [index for index in active if len(values[index]) <= share]
+            if not satisfied:
+                for position, index in enumerate(sorted(active)):
+                    allocations[index] = share + (1 if position < remainder else 0)
+                break
+            for index in satisfied:
+                allocations[index] = len(values[index])
+                available -= allocations[index]
+                active.remove(index)
+        rendered = render([
+            self._compact_text(value, allocation)
+            for value, allocation in zip(values, allocations)
+        ])
+        return rendered[:self.reviewer_input_limit], True, len(original)
+
+    async def run(
+        self,
+        objective: str | None = None,
+        *,
+        resume_id: str | None = None,
+        config: WorkflowConfig | None = None,
+    ) -> WorkflowResult:
         if resume_id is not None:
             if objective is not None:
                 raise ValueError("Do not supply an objective when resuming a run")
             run_id = resume_id
+            run, _, _ = self.store.run_details(run_id)
+            effective_config = self._config_for_run(run, config)
+            self._validate_runtime_config(effective_config)
             objective = self.store.resume_run(run_id)
             self.progress(f"[{run_id}] resuming run")
         else:
             if objective is None:
                 raise ValueError("An objective is required for a new run")
-            run_id = self.store.create_run(objective)
+            effective_config = config or self._default_config()
+            self._validate_runtime_config(effective_config)
+            run_id = self.store.create_run(objective, effective_config.to_json())
             self.progress(f"[{run_id}] created run")
         try:
-            producer_a = self._agent("producer-a", "producer", PRODUCER_PROMPT)
-            producer_b = self._agent("producer-b", "producer", PRODUCER_PROMPT)
-            critic_a = self._agent("critic-a", "critic", CRITIC_PROMPT)
-            critic_b = self._agent("critic-b", "critic", CRITIC_PROMPT)
-            reviewer = self._agent("reviewer", "reviewer", JUDGE_PROMPT)
-
             completed = self.store.artifacts_for_run(run_id)
             if resume_id is not None:
-                for artifact in completed.values():
+                for slot in effective_config.slots:
+                    artifact = completed.get(slot)
+                    if artifact is None:
+                        continue
                     self.store.event(
                         run_id,
                         artifact.stage,
@@ -284,63 +429,48 @@ class CollaborationWorkflow:
                         artifact.author,
                     )
                     self.progress(f"[{run_id}] {artifact.stage}: reusing {artifact.author}")
-            proposal_agents = [producer_a, producer_b]
-            missing_proposals = [
-                self._call(run_id, "proposal", agent, objective)
-                for agent in proposal_agents
-                if ("proposal", agent.agent_id) not in completed
-            ]
-            if missing_proposals:
-                await self._complete_stage(missing_proposals)
-                completed = self.store.artifacts_for_run(run_id)
-            proposals = [completed[("proposal", agent.agent_id)] for agent in proposal_agents]
-            proposal_text = [Path(item.path).read_text(encoding="utf-8") for item in proposals]
-
-            critique_calls = [
-                (critic_a, f"OBJECTIVE:\n{objective}\n\nCANDIDATE B:\n{proposal_text[1]}"),
-                (critic_b, f"OBJECTIVE:\n{objective}\n\nCANDIDATE A:\n{proposal_text[0]}"),
-            ]
-            missing_critiques = [
-                self._call(run_id, "critique", agent, prompt)
-                for agent, prompt in critique_calls
-                if ("critique", agent.agent_id) not in completed
-            ]
-            if missing_critiques:
-                await self._complete_stage(missing_critiques)
-                completed = self.store.artifacts_for_run(run_id)
-            critiques = [completed[("critique", agent.agent_id)] for agent, _ in critique_calls]
-            critique_text = [Path(item.path).read_text(encoding="utf-8") for item in critiques]
-
-            judge_sections = [
-                ("OBJECTIVE", objective),
-                ("PROPOSAL A", proposal_text[0]),
-                ("PROPOSAL B", proposal_text[1]),
-                ("CRITIQUE OF B", critique_text[0]),
-                ("CRITIQUE OF A", critique_text[1]),
-            ]
-            original_judge_chars = len("\n\n".join(
-                f"{label}:\n{value}" for label, value in judge_sections
-            ))
-            judge_input, compacted = self._build_judge_input(judge_sections)
-            if compacted:
-                self.store.event(
-                    run_id,
-                    "final",
-                    "reviewer_input_compacted",
-                    {
-                        "original_chars": original_judge_chars,
-                        "compacted_chars": len(judge_input),
-                        "max_chars": self.reviewer_input_limit,
-                    },
-                    reviewer.agent_id,
-                )
-                self.progress(
-                    f"[{run_id}] final: compacted reviewer input "
-                    f"from {original_judge_chars} to {len(judge_input)} characters"
-                )
-            final_artifact = completed.get(("final", reviewer.agent_id))
-            if final_artifact is None:
-                final_artifact = await self._call(run_id, "final", reviewer, judge_input)
+            for stage in effective_config.stages:
+                calls = []
+                for configured_agent in stage.agents:
+                    slot = (stage.stage_id, configured_agent.agent_id)
+                    if slot in completed:
+                        continue
+                    agent = AgentSpec(
+                        configured_agent.agent_id,
+                        configured_agent.role,
+                        configured_agent.provider,
+                        configured_agent.model,
+                        configured_agent.system_prompt,
+                    )
+                    prompt, compacted, original_chars = self._render_input(
+                        configured_agent.input_template,
+                        objective,
+                        completed,
+                        compact=agent.role == "reviewer",
+                    )
+                    if compacted:
+                        self.store.event(
+                            run_id,
+                            stage.stage_id,
+                            "reviewer_input_compacted",
+                            {
+                                "original_chars": original_chars,
+                                "compacted_chars": len(prompt),
+                                "max_chars": self.reviewer_input_limit,
+                            },
+                            agent.agent_id,
+                        )
+                        self.progress(
+                            f"[{run_id}] {stage.stage_id}: compacted reviewer input "
+                            f"from {original_chars} to {len(prompt)} characters"
+                        )
+                    calls.append(self._call(run_id, stage.stage_id, agent, prompt))
+                if calls:
+                    await self._complete_stage(calls)
+                    completed = self.store.artifacts_for_run(run_id)
+            final_stage = effective_config.stages[-1]
+            final_agent = final_stage.agents[0]
+            final_artifact = completed[(final_stage.stage_id, final_agent.agent_id)]
             self.store.finish(run_id)
             self.progress(f"[{run_id}] workflow completed")
             return WorkflowResult(run_id, final_artifact)

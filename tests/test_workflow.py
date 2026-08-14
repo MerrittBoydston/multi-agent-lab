@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from multi_agent_lab.config import config_from_mapping
 from multi_agent_lab.models import AgentSpec, CompletionResult
 from multi_agent_lab.providers import AnthropicProvider, MockProvider, OpenAIProvider
 from multi_agent_lab.workflow import CollaborationWorkflow, WorkflowInterrupted
@@ -20,6 +21,104 @@ from multi_agent_lab.validation import (
 
 
 class WorkflowTest(unittest.TestCase):
+    @staticmethod
+    def custom_config(model="mock-v1"):
+        return config_from_mapping({
+            "version": 1,
+            "stages": [
+                {
+                    "id": "draft",
+                    "agents": [{
+                        "id": "writer",
+                        "role": "producer",
+                        "provider": "mock",
+                        "model": model,
+                        "system_prompt": "Write a draft",
+                        "input": "Brief: {{ objective }}",
+                    }],
+                },
+                {
+                    "id": "decision",
+                    "agents": [{
+                        "id": "judge",
+                        "role": "reviewer",
+                        "provider": "mock",
+                        "model": model,
+                        "system_prompt": "Make a decision",
+                        "input": "BRIEF:\n{{ objective }}\n\nDRAFT:\n{{ artifact.draft.writer }}",
+                    }],
+                },
+            ],
+        })
+
+    def test_custom_config_executes_and_persists_snapshot(self):
+        with tempfile.TemporaryDirectory() as folder:
+            workspace = Path(folder)
+            config = self.custom_config()
+            result = asyncio.run(
+                CollaborationWorkflow(workspace).run("Configurable objective", config=config)
+            )
+            with closing(sqlite3.connect(workspace / "runs.db")) as db:
+                config_json = db.execute(
+                    "SELECT config_json FROM runs WHERE run_id = ?", (result.run_id,)
+                ).fetchone()[0]
+                slots = db.execute(
+                    "SELECT stage, author FROM artifacts WHERE run_id = ? ORDER BY created_at",
+                    (result.run_id,),
+                ).fetchall()
+            self.assertEqual(config_json, config.to_json())
+            self.assertEqual(slots, [("draft", "writer"), ("decision", "judge")])
+
+    def test_resume_uses_snapshot_and_rejects_incompatible_config(self):
+        with tempfile.TemporaryDirectory() as folder:
+            workspace = Path(folder)
+            workflow = CollaborationWorkflow(workspace)
+            config = self.custom_config()
+            original_complete = MockProvider.complete
+
+            async def fail_judge(provider, agent, prompt):
+                if agent.agent_id == "judge":
+                    raise RuntimeError("stop after draft")
+                return await original_complete(provider, agent, prompt)
+
+            with patch.object(MockProvider, "complete", fail_judge):
+                with self.assertRaisesRegex(RuntimeError, "stop after draft"):
+                    asyncio.run(workflow.run("Snapshot me", config=config))
+            run_id = workflow.store.failed_run_ids()[0]
+
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                asyncio.run(workflow.run(resume_id=run_id, config=self.custom_config("other-model")))
+            result = asyncio.run(workflow.run(resume_id=run_id))
+            self.assertEqual(result.run_id, run_id)
+
+    def test_runtime_requirements_are_checked_before_run_creation(self):
+        config = self.custom_config()
+        raw = json.loads(config.to_json())
+        raw["stages"][0]["agents"][0]["provider"] = "anthropic"
+        config = config_from_mapping(raw)
+        with tempfile.TemporaryDirectory() as folder, patch.dict("os.environ", {}, clear=True), patch(
+            "multi_agent_lab.workflow.importlib.util.find_spec", return_value=object()
+        ):
+            workflow = CollaborationWorkflow(Path(folder))
+            with self.assertRaisesRegex(ValueError, "ANTHROPIC_API_KEY"):
+                asyncio.run(workflow.run("Missing credentials", config=config))
+            self.assertEqual(workflow.store.list_runs(), [])
+
+    def test_existing_database_is_migrated_for_config_snapshots(self):
+        with tempfile.TemporaryDirectory() as folder:
+            workspace = Path(folder)
+            workspace.mkdir(exist_ok=True)
+            with closing(sqlite3.connect(workspace / "runs.db")) as db:
+                db.execute(
+                    "CREATE TABLE runs (run_id TEXT PRIMARY KEY, objective TEXT NOT NULL, "
+                    "status TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT)"
+                )
+                db.commit()
+            CollaborationWorkflow(workspace)
+            with closing(sqlite3.connect(workspace / "runs.db")) as db:
+                columns = {row[1] for row in db.execute("PRAGMA table_info(runs)")}
+            self.assertIn("config_json", columns)
+
     def test_mock_workflow_creates_auditable_artifacts(self):
         with tempfile.TemporaryDirectory() as folder, patch.dict("os.environ", {"AGENT_PROVIDER": "mock"}):
             workspace = Path(folder)

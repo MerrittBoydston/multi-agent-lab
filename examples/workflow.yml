@@ -1,0 +1,66 @@
+version: 1
+stages:
+  - id: proposal
+    agents:
+      - id: producer-a
+        role: producer
+        provider: mock
+        model: mock-v1
+        system_prompt: >-
+          Produce an independent proposal with assumptions, risks, and confidence.
+        input: "{{ objective }}"
+      - id: producer-b
+        role: producer
+        provider: mock
+        model: mock-v1
+        system_prompt: >-
+          Produce a contrasting independent proposal with assumptions, risks, and confidence.
+        input: "{{ objective }}"
+
+  - id: critique
+    agents:
+      - id: critic-a
+        role: critic
+        provider: mock
+        model: mock-v1
+        system_prompt: Critique the candidate and return findings, a recommendation, and confidence.
+        input: |-
+          OBJECTIVE:
+          {{ objective }}
+
+          CANDIDATE:
+          {{ artifact.proposal.producer-b }}
+      - id: critic-b
+        role: critic
+        provider: mock
+        model: mock-v1
+        system_prompt: Critique the candidate and return findings, a recommendation, and confidence.
+        input: |-
+          OBJECTIVE:
+          {{ objective }}
+
+          CANDIDATE:
+          {{ artifact.proposal.producer-a }}
+
+  - id: final
+    agents:
+      - id: reviewer
+        role: reviewer
+        provider: mock
+        model: mock-v1
+        system_prompt: Synthesize the proposals and critiques into a final decision.
+        input: |-
+          OBJECTIVE:
+          {{ objective }}
+
+          PROPOSAL A:
+          {{ artifact.proposal.producer-a }}
+
+          PROPOSAL B:
+          {{ artifact.proposal.producer-b }}
+
+          CRITIQUE A:
+          {{ artifact.critique.critic-a }}
+
+          CRITIQUE B:
+          {{ artifact.critique.critic-b }}

@@ -37,7 +37,8 @@ class RunStore:
                     objective TEXT NOT NULL,
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    completed_at TEXT
+                    completed_at TEXT,
+                    config_json TEXT
                 );
                 CREATE TABLE IF NOT EXISTS events (
                     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,13 +61,17 @@ class RunStore:
                     ON artifacts (run_id, stage, author);
                 """
             )
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(runs)")}
+            if "config_json" not in columns:
+                db.execute("ALTER TABLE runs ADD COLUMN config_json TEXT")
 
-    def create_run(self, objective: str) -> str:
+    def create_run(self, objective: str, config_json: str | None = None) -> str:
         run_id = uuid.uuid4().hex[:12]
         with self._connect() as db:
             db.execute(
-                "INSERT INTO runs VALUES (?, ?, ?, ?, NULL)",
-                (run_id, objective, "running", utc_now()),
+                "INSERT INTO runs (run_id, objective, status, created_at, completed_at, config_json) "
+                "VALUES (?, ?, ?, ?, NULL, ?)",
+                (run_id, objective, "running", utc_now(), config_json),
             )
         return run_id
 
@@ -108,7 +113,7 @@ class RunStore:
     def run_details(self, run_id: str) -> tuple[sqlite3.Row, list[sqlite3.Row], list[sqlite3.Row]]:
         with self._connect() as db:
             run = db.execute(
-                "SELECT run_id, status, created_at, completed_at, objective "
+                "SELECT run_id, status, created_at, completed_at, objective, config_json "
                 "FROM runs WHERE run_id = ?", (run_id,)
             ).fetchone()
             if run is None:
