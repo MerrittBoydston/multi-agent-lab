@@ -18,11 +18,14 @@ as described in [SECURITY.md](SECURITY.md).
 
 ## Step 1 — run it safely with mock agents
 
-No API key or package installation is needed:
+No API key is needed. Install the package in a virtual environment:
 
 ```bash
 cd multi-agent-lab
-PYTHONPATH=src python3 -m multi_agent_lab.cli \
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+multi-agent-lab \
   "Design a client onboarding system for a small AI consultancy"
 ```
 
@@ -79,6 +82,47 @@ PYTHONPATH=src python3 -m multi_agent_lab.cli \
 During execution, stage starts, completions, reused artifacts, compaction, and retries are printed to stderr. Errors are reported concisely without a Python traceback and failed resumes print a reusable resume command.
 
 The database enforces at most one artifact for each run, stage, and agent.
+
+## Configure a workflow with YAML
+
+Pass `--config` to replace the built-in producer/critic/reviewer topology with a
+validated sequence of stages. Agents in the same stage run in parallel; stages
+run in file order. The final stage must contain exactly one agent.
+
+```bash
+multi-agent-lab \
+  --workspace .multi-agent-lab \
+  --config examples/workflow.yml \
+  "Evaluate a practical workflow improvement"
+```
+
+Each agent declares an `id`, output-validation `role`, `provider`, `model`,
+`system_prompt`, and `input`. Input templates support only these inert tokens:
+
+- `{{ objective }}` — the run objective.
+- `{{ artifact.STAGE.AGENT }}` — an artifact produced by an earlier stage.
+
+Unknown tokens, forward references, duplicate stage or agent IDs, unsupported
+roles or providers, missing models, and ambiguous final stages are rejected
+before a run is created. See [`examples/workflow.yml`](examples/workflow.yml) for
+a complete configuration that runs entirely with mock providers.
+
+The fully resolved configuration—including providers, models, prompts, and
+templates—is stored as a canonical snapshot on every new run. Resuming without
+`--config` always uses that snapshot:
+
+```bash
+multi-agent-lab --workspace .multi-agent-lab --resume RUN_ID
+```
+
+Supplying `--config` while resuming is optional verification. The command is
+rejected before changing run state unless the supplied file exactly matches the
+stored snapshot. This also applies to `--resume-latest` and `--retry-failed`.
+
+Runs created before v0.2.0 have no snapshot and continue using the original
+built-in topology, resolved from the current provider environment variables.
+No manual database migration is required; the snapshot column is added safely
+when an existing workspace is opened.
 
 Transient provider failures (connection errors, timeouts, rate limits, and server errors) are retried three times with exponential backoff. Configure this behavior with `AGENT_MAX_RETRIES` and `AGENT_RETRY_DELAY_SECONDS`; each retry is recorded as an `agent_retrying` audit event.
 

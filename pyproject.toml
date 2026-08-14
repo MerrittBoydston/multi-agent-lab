@@ -1,10 +1,10 @@
 [project]
 name = "multi-agent-lab"
-version = "0.1.0"
+version = "0.2.0"
 description = "A local, provider-neutral multi-agent collaboration workflow"
 requires-python = ">=3.11"
 license = "MIT"
-dependencies = []
+dependencies = ["PyYAML>=6.0"]
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40"]

@@ -57,6 +57,21 @@ class CliTest(unittest.TestCase):
             self.assertIn("Providers/models:", shown.stdout)
             self.assertIn("mock/mock-v1: 5 agents", shown.stdout)
 
+    def test_runs_with_yaml_config_and_reports_snapshot(self):
+        with tempfile.TemporaryDirectory() as folder:
+            workspace = Path(folder)
+            config = Path(__file__).parents[1] / "examples" / "workflow.yml"
+            created = self.run_cli(workspace, "--config", str(config), "Configured run")
+            self.assertEqual(created.returncode, 0, created.stderr)
+            run_id = next(
+                line.removeprefix("Run: ")
+                for line in created.stdout.splitlines()
+                if line.startswith("Run: ")
+            )
+            shown = self.run_cli(workspace, "--show-run", run_id)
+            self.assertEqual(shown.returncode, 0, shown.stderr)
+            self.assertIn("Configuration: stored snapshot", shown.stdout)
+
     def test_errors_are_concise(self):
         with tempfile.TemporaryDirectory() as folder:
             result = self.run_cli(Path(folder), "--resume", "missing")
