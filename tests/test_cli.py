@@ -4,6 +4,8 @@ import sys
 import tempfile
 import unittest
 import sqlite3
+import json
+import zipfile
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -96,6 +98,75 @@ class CliTest(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("Error: Run 'missing' does not exist", result.stderr)
             self.assertNotIn("Traceback", result.stderr)
+
+    def test_export_import_report_round_trip(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "source"
+            destination = root / "destination"
+            bundle = root / "run.zip"
+            created = self.run_cli(source, "Portable run")
+            self.assertEqual(created.returncode, 0, created.stderr)
+            run_id = next(line.removeprefix("Run: ") for line in created.stdout.splitlines()
+                          if line.startswith("Run: "))
+
+            exported = self.run_cli(source, "--export-run", run_id, "--output", str(bundle))
+            self.assertEqual(exported.returncode, 0, exported.stderr)
+            self.assertTrue(bundle.is_file())
+            imported = self.run_cli(destination, "--import-run", str(bundle))
+            self.assertEqual(imported.returncode, 0, imported.stderr)
+            self.assertIn(f"Imported run: {run_id}", imported.stdout)
+
+            shown = self.run_cli(destination, "--show-run", run_id)
+            self.assertEqual(shown.returncode, 0, shown.stderr)
+            self.assertIn("Objective: Portable run", shown.stdout)
+            self.assertIn("final/reviewer", shown.stdout)
+            report = self.run_cli(destination, "--report", run_id)
+            self.assertEqual(report.returncode, 0, report.stderr)
+            self.assertIn(f"# Run {run_id}", report.stdout)
+            self.assertIn("## Metrics", report.stdout)
+            self.assertIn("## Audit summary", report.stdout)
+
+            duplicate = self.run_cli(destination, "--import-run", str(bundle))
+            self.assertEqual(duplicate.returncode, 1)
+            self.assertIn("already exists", duplicate.stderr)
+
+    def test_import_rejects_tampered_artifact_without_writes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "source"
+            destination = root / "destination"
+            bundle = root / "run.zip"
+            tampered = root / "tampered.zip"
+            created = self.run_cli(source, "Tamper test")
+            run_id = next(line.removeprefix("Run: ") for line in created.stdout.splitlines()
+                          if line.startswith("Run: "))
+            self.assertEqual(self.run_cli(source, "--export-run", run_id, "--output", str(bundle)).returncode, 0)
+            with zipfile.ZipFile(bundle) as original, zipfile.ZipFile(tampered, "w") as changed:
+                for info in original.infolist():
+                    content = original.read(info.filename)
+                    if info.filename.startswith("artifacts/"):
+                        content += b"modified"
+                    changed.writestr(info.filename, content)
+            result = self.run_cli(destination, "--import-run", str(tampered))
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("checksum does not match", result.stderr)
+            self.assertEqual(self.run_cli(destination, "--list-runs").stdout, "No runs found.\n")
+
+    def test_import_rejects_unsafe_or_undeclared_archive_member(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            bundle = root / "unsafe.zip"
+            manifest = {"schema_version": 1, "run": {}, "events": [], "artifacts": []}
+            manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+            import hashlib
+            with zipfile.ZipFile(bundle, "w") as archive:
+                archive.writestr("manifest.json", manifest_bytes)
+                archive.writestr("manifest.sha256", hashlib.sha256(manifest_bytes).hexdigest())
+                archive.writestr("../escape", b"bad")
+            result = self.run_cli(root / "workspace", "--import-run", str(bundle))
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("unsafe archive path", result.stderr)
 
     def create_failed_run(self, workspace: Path, objective: str, completed_slots=()) -> str:
         from multi_agent_lab.workflow import CollaborationWorkflow
