@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from multi_agent_lab.config import config_from_mapping
+from multi_agent_lab.config import config_from_mapping, load_config
 from multi_agent_lab.models import AgentSpec, CompletionResult
 from multi_agent_lab.providers import AnthropicProvider, MockProvider, OpenAIProvider
 from multi_agent_lab.workflow import CollaborationWorkflow, WorkflowInterrupted
@@ -21,6 +21,23 @@ from multi_agent_lab.validation import (
 
 
 class WorkflowTest(unittest.TestCase):
+    def test_conditional_bounded_loop_preserves_iterations_and_decisions(self):
+        config = load_config(Path(__file__).parents[1] / "examples" / "conditional-workflow.yml")
+        with tempfile.TemporaryDirectory() as folder:
+            workspace = Path(folder)
+            result = asyncio.run(CollaborationWorkflow(workspace).run("Improve it", config=config))
+            with closing(sqlite3.connect(workspace / "runs.db")) as db:
+                stages = [row[0] for row in db.execute(
+                    "SELECT stage FROM artifacts WHERE run_id = ? ORDER BY created_at", (result.run_id,)
+                )]
+                events = [row[0] for row in db.execute(
+                    "SELECT event_type FROM events WHERE run_id = ?", (result.run_id,)
+                )]
+            self.assertIn("revision--iteration-1", stages)
+            self.assertIn("revision--iteration-2", stages)
+            self.assertIn("revision--iteration-3", stages)
+            self.assertEqual(events.count("loop_iteration_completed"), 3)
+
     @staticmethod
     def custom_config(model="mock-v1"):
         return config_from_mapping({

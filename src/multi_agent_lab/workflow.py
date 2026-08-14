@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import os
 import re
 import time
@@ -9,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .config import OBJECTIVE_PATTERN, REFERENCE_PATTERN, WorkflowConfig, config_from_mapping
+from .config import OBJECTIVE_PATTERN, PREVIOUS_PATTERN, REFERENCE_PATTERN, WorkflowConfig, config_from_mapping
 from .models import AgentSpec, Artifact
 from .providers import bounded_completion, provider_for
 from .store import RunStore
@@ -56,7 +57,7 @@ class CollaborationWorkflow:
         if run["status"] != "failed":
             raise ValueError(f"Run {run_id!r} is {run['status']!r}, not failed")
         config = self._config_for_run(run, requested_config)
-        completed = self.store.artifacts_for_run(run_id)
+        completed = self._with_iteration_aliases(self.store.artifacts_for_run(run_id))
         reused = [slot for slot in config.slots if slot in completed]
         missing = [slot for slot in config.slots if slot not in completed]
         return reused, missing
@@ -341,15 +342,18 @@ class CollaborationWorkflow:
         completed: dict[tuple[str, str], Artifact],
         *,
         compact: bool,
+        previous: str = "",
     ) -> tuple[str, bool, int]:
         token_pattern = re.compile(
-            rf"{OBJECTIVE_PATTERN.pattern}|{REFERENCE_PATTERN.pattern}"
+            rf"{OBJECTIVE_PATTERN.pattern}|{PREVIOUS_PATTERN.pattern}|{REFERENCE_PATTERN.pattern}"
         )
         matches = list(token_pattern.finditer(template))
         values = []
         for match in matches:
             if OBJECTIVE_PATTERN.fullmatch(match.group(0)):
                 values.append(objective)
+            elif PREVIOUS_PATTERN.fullmatch(match.group(0)):
+                values.append(previous)
             else:
                 reference = REFERENCE_PATTERN.fullmatch(match.group(0))
                 slot = (reference.group(1), reference.group(2))
@@ -391,6 +395,51 @@ class CollaborationWorkflow:
         ])
         return rendered[:self.reviewer_input_limit], True, len(original)
 
+    @staticmethod
+    def _condition_met(condition: dict, completed: dict[tuple[str, str], Artifact]) -> bool:
+        stage, author = condition["artifact"].split("/", 1)
+        artifact = completed.get((stage, author))
+        if artifact is None:
+            return False
+        value = json.loads(Path(artifact.path).read_text(encoding="utf-8"))
+        for part in condition["field"].split("."):
+            if not isinstance(value, dict) or part not in value:
+                return False
+            value = value[part]
+        return value == condition["equals"]
+
+    @staticmethod
+    def _with_iteration_aliases(
+        completed: dict[tuple[str, str], Artifact],
+    ) -> dict[tuple[str, str], Artifact]:
+        result = dict(completed)
+        pattern = re.compile(r"^(.+)--iteration-(\d+)$")
+        latest = {}
+        for (stage, author), artifact in completed.items():
+            match = pattern.fullmatch(stage)
+            if match:
+                key = (match.group(1), author)
+                iteration = int(match.group(2))
+                if iteration > latest.get(key, (0, None))[0]:
+                    latest[key] = (iteration, artifact)
+        result.update({key: value[1] for key, value in latest.items()})
+        return result
+
+    @staticmethod
+    def describe(config: WorkflowConfig) -> str:
+        lines = [f"Workflow graph (version {config.version}):"]
+        for stage in config.stages:
+            deps = ", ".join(stage.depends_on) or "root"
+            detail = f"  {stage.stage_id} <- {deps}"
+            if stage.when:
+                detail += f" [when {stage.when['artifact']}.{stage.when['field']} == {stage.when['equals']!r}]"
+            if stage.repeat:
+                detail += f" [repeat <= {stage.repeat['max_iterations']} until condition]"
+            lines.append(detail)
+            for agent in stage.agents:
+                lines.append(f"    {agent.agent_id}: {agent.role} ({agent.provider}/{agent.model})")
+        return "\n".join(lines)
+
     async def run(
         self,
         objective: str | None = None,
@@ -429,45 +478,65 @@ class CollaborationWorkflow:
                         artifact.author,
                     )
                     self.progress(f"[{run_id}] {artifact.stage}: reusing {artifact.author}")
+            completed = self._with_iteration_aliases(completed)
             for stage in effective_config.stages:
-                calls = []
-                for configured_agent in stage.agents:
-                    slot = (stage.stage_id, configured_agent.agent_id)
-                    if slot in completed:
+                if stage.when:
+                    execute = self._condition_met(stage.when, completed)
+                    self.store.event(
+                        run_id, stage.stage_id, "stage_condition_evaluated",
+                        {"condition": stage.when, "execute": execute},
+                    )
+                    if not execute:
+                        self.store.event(run_id, stage.stage_id, "stage_skipped", {"condition": stage.when})
+                        self.progress(f"[{run_id}] {stage.stage_id}: skipped (condition false)")
                         continue
-                    agent = AgentSpec(
-                        configured_agent.agent_id,
-                        configured_agent.role,
-                        configured_agent.provider,
-                        configured_agent.model,
-                        configured_agent.system_prompt,
+                maximum = stage.repeat["max_iterations"] if stage.repeat else 1
+                for iteration in range(1, maximum + 1):
+                    persisted_stage = (
+                        f"{stage.stage_id}--iteration-{iteration}" if stage.repeat else stage.stage_id
                     )
-                    prompt, compacted, original_chars = self._render_input(
-                        configured_agent.input_template,
-                        objective,
-                        completed,
-                        compact=agent.role == "reviewer",
-                    )
-                    if compacted:
+                    calls = []
+                    for configured_agent in stage.agents:
+                        slot = (persisted_stage, configured_agent.agent_id)
+                        if slot in completed:
+                            continue
+                        previous_artifact = completed.get((stage.stage_id, configured_agent.agent_id))
+                        previous = (
+                            Path(previous_artifact.path).read_text(encoding="utf-8")
+                            if previous_artifact else ""
+                        )
+                        agent = AgentSpec(
+                            configured_agent.agent_id,
+                            configured_agent.role,
+                            configured_agent.provider,
+                            configured_agent.model,
+                            configured_agent.system_prompt,
+                        )
+                        prompt, compacted, original_chars = self._render_input(
+                            configured_agent.input_template,
+                            objective,
+                            completed,
+                            compact=agent.role == "reviewer",
+                            previous=previous,
+                        )
+                        if compacted:
+                            self.store.event(
+                                run_id, persisted_stage, "reviewer_input_compacted",
+                                {"original_chars": original_chars, "compacted_chars": len(prompt),
+                                 "max_chars": self.reviewer_input_limit}, agent.agent_id,
+                            )
+                        calls.append(self._call(run_id, persisted_stage, agent, prompt))
+                    if calls:
+                        await self._complete_stage(calls)
+                        completed = self._with_iteration_aliases(self.store.artifacts_for_run(run_id))
+                    if stage.repeat:
+                        stop = self._condition_met(stage.repeat["until"], completed)
                         self.store.event(
-                            run_id,
-                            stage.stage_id,
-                            "reviewer_input_compacted",
-                            {
-                                "original_chars": original_chars,
-                                "compacted_chars": len(prompt),
-                                "max_chars": self.reviewer_input_limit,
-                            },
-                            agent.agent_id,
+                            run_id, stage.stage_id, "loop_iteration_completed",
+                            {"iteration": iteration, "stop": stop, "max_iterations": maximum},
                         )
-                        self.progress(
-                            f"[{run_id}] {stage.stage_id}: compacted reviewer input "
-                            f"from {original_chars} to {len(prompt)} characters"
-                        )
-                    calls.append(self._call(run_id, stage.stage_id, agent, prompt))
-                if calls:
-                    await self._complete_stage(calls)
-                    completed = self.store.artifacts_for_run(run_id)
+                        if stop:
+                            break
             final_stage = effective_config.stages[-1]
             final_agent = final_stage.agents[0]
             final_artifact = completed[(final_stage.stage_id, final_agent.agent_id)]

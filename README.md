@@ -124,6 +124,28 @@ built-in topology, resolved from the current provider environment variables.
 No manual database migration is required; the snapshot column is added safely
 when an existing workspace is opened.
 
+### Conditional graphs and bounded loops
+
+Configuration version 2 adds explicit `depends_on` edges, safe `when`
+conditions over JSON artifact fields, and bounded `repeat` blocks with an
+`until` condition. Loop limits must be between 1 and 20. `{{ previous }}` gives
+each repeated agent its output from the prior iteration.
+
+```bash
+multi-agent-lab --config examples/conditional-workflow.yml --dry-run
+multi-agent-lab --config examples/conditional-workflow.yml "Improve this plan"
+```
+
+`--dry-run` validates the graph and prints dependencies, conditions, loop
+bounds, agents, providers, and models without creating a run or calling a
+provider. See [`examples/conditional-workflow.yml`](examples/conditional-workflow.yml).
+
+Conditional outcomes are recorded as `stage_condition_evaluated` and
+`stage_skipped` events. Each loop pass is stored as an immutable artifact under
+a stage name such as `revision--iteration-2`, and
+`loop_iteration_completed` records whether its stop condition fired. Resume
+reuses those iteration artifacts and continues only missing bounded work.
+
 Transient provider failures (connection errors, timeouts, rate limits, and server errors) are retried three times with exponential backoff. Configure this behavior with `AGENT_MAX_RETRIES` and `AGENT_RETRY_DELAY_SECONDS`; each retry is recorded as an `agent_retrying` audit event.
 
 Anthropic responses use streaming so long generations continue sending data instead of leaving an idle HTTP connection open.

@@ -1,6 +1,6 @@
 [project]
 name = "multi-agent-lab"
-version = "0.2.0"
+version = "0.3.0"
 description = "A local, provider-neutral multi-agent collaboration workflow"
 requires-python = ">=3.11"
 license = "MIT"

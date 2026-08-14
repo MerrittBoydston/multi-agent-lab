@@ -12,6 +12,7 @@ import yaml
 ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]*$")
 REFERENCE_PATTERN = re.compile(r"{{\s*artifact\.([a-z][a-z0-9-]*)\.([a-z][a-z0-9-]*)\s*}}")
 OBJECTIVE_PATTERN = re.compile(r"{{\s*objective\s*}}")
+PREVIOUS_PATTERN = re.compile(r"{{\s*previous\s*}}")
 ROLES = {"producer", "critic", "reviewer"}
 PROVIDERS = {"mock", "anthropic", "openai"}
 
@@ -30,6 +31,9 @@ class ConfigAgent:
 class ConfigStage:
     stage_id: str
     agents: tuple[ConfigAgent, ...]
+    depends_on: tuple[str, ...] = ()
+    when: dict[str, Any] | None = None
+    repeat: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +47,9 @@ class WorkflowConfig:
             "stages": [
                 {
                     "id": stage.stage_id,
+                    **({"depends_on": list(stage.depends_on)} if self.version == 2 else {}),
+                    **({"when": stage.when} if stage.when else {}),
+                    **({"repeat": stage.repeat} if stage.repeat else {}),
                     "agents": [
                         {
                             "id": agent.agent_id,
@@ -85,8 +92,9 @@ def config_from_mapping(raw: Any) -> WorkflowConfig:
     unknown = set(raw) - {"version", "stages"}
     if unknown:
         raise ValueError(f"unknown configuration field(s): {', '.join(sorted(unknown))}")
-    if raw.get("version") != 1:
-        raise ValueError("configuration version must be 1")
+    version = raw.get("version")
+    if version not in {1, 2}:
+        raise ValueError("configuration version must be 1 or 2")
     raw_stages = raw.get("stages")
     if not isinstance(raw_stages, list) or not raw_stages:
         raise ValueError("stages must be a non-empty array")
@@ -97,14 +105,44 @@ def config_from_mapping(raw: Any) -> WorkflowConfig:
     agent_ids: set[str] = set()
     for stage_index, raw_stage in enumerate(raw_stages):
         location = f"stages[{stage_index}]"
-        if not isinstance(raw_stage, dict) or set(raw_stage) != {"id", "agents"}:
-            raise ValueError(f"{location} must contain only id and agents")
+        allowed = {"id", "agents"} if version == 1 else {"id", "agents", "depends_on", "when", "repeat"}
+        if not isinstance(raw_stage, dict) or not {"id", "agents"}.issubset(raw_stage) or set(raw_stage) - allowed:
+            raise ValueError(f"{location} contains invalid stage fields")
         stage_id = _nonempty_string(raw_stage["id"], f"{location}.id")
         if not ID_PATTERN.fullmatch(stage_id):
             raise ValueError(f"{location}.id must use lowercase letters, numbers, and hyphens")
         if stage_id in stage_ids:
             raise ValueError(f"duplicate stage id {stage_id!r}")
         stage_ids.add(stage_id)
+        depends_on = tuple(raw_stage.get("depends_on", ())) if version == 2 else (() if not stages else (stages[-1].stage_id,))
+        if not all(isinstance(item, str) for item in depends_on) or len(set(depends_on)) != len(depends_on):
+            raise ValueError(f"{location}.depends_on must contain unique stage ids")
+        if stage_id in depends_on:
+            raise ValueError(f"{location}.depends_on cannot reference itself")
+        missing_dependencies = set(depends_on) - (stage_ids - {stage_id})
+        if missing_dependencies:
+            raise ValueError(f"{location}.depends_on references unavailable stage {sorted(missing_dependencies)[0]!r}")
+        when = raw_stage.get("when") if version == 2 else None
+        repeat = raw_stage.get("repeat") if version == 2 else None
+        for name, condition in (("when", when), ("repeat.until", repeat.get("until") if isinstance(repeat, dict) else None)):
+            if condition is not None:
+                if not isinstance(condition, dict) or set(condition) != {"artifact", "field", "equals"}:
+                    raise ValueError(f"{location}.{name} must contain artifact, field, and equals")
+                parts = str(condition["artifact"]).split("/")
+                allowed_condition_slots = known_slots
+                if name == "repeat.until":
+                    allowed_condition_slots = allowed_condition_slots | {
+                        (stage_id, str(a.get("id"))) for a in raw_stage["agents"] if isinstance(a, dict)
+                    }
+                if len(parts) != 2 or tuple(parts) not in allowed_condition_slots:
+                    raise ValueError(f"{location}.{name} references an unavailable artifact")
+                _nonempty_string(condition["field"], f"{location}.{name}.field")
+        if repeat is not None:
+            if not isinstance(repeat, dict) or set(repeat) != {"max_iterations", "until"}:
+                raise ValueError(f"{location}.repeat must contain max_iterations and until")
+            maximum = repeat["max_iterations"]
+            if isinstance(maximum, bool) or not isinstance(maximum, int) or not 1 <= maximum <= 20:
+                raise ValueError(f"{location}.repeat.max_iterations must be from 1 to 20")
         raw_agents = raw_stage["agents"]
         if not isinstance(raw_agents, list) or not raw_agents:
             raise ValueError(f"{location}.agents must be a non-empty array")
@@ -131,7 +169,8 @@ def config_from_mapping(raw: Any) -> WorkflowConfig:
             system_prompt = _nonempty_string(raw_agent["system_prompt"], f"{agent_location}.system_prompt")
             input_template = _nonempty_string(raw_agent["input"], f"{agent_location}.input")
             references = set(REFERENCE_PATTERN.findall(input_template))
-            unresolved_tokens = re.findall(r"{{.*?}}", REFERENCE_PATTERN.sub("", OBJECTIVE_PATTERN.sub("", input_template)))
+            stripped = REFERENCE_PATTERN.sub("", OBJECTIVE_PATTERN.sub("", PREVIOUS_PATTERN.sub("", input_template)))
+            unresolved_tokens = re.findall(r"{{.*?}}", stripped)
             if unresolved_tokens:
                 raise ValueError(f"{agent_location}.input contains unsupported template {unresolved_tokens[0]!r}")
             missing = references - known_slots
@@ -144,11 +183,13 @@ def config_from_mapping(raw: Any) -> WorkflowConfig:
             agents.append(agent)
             stage_slots.add((stage_id, agent_id))
         known_slots.update(stage_slots)
-        stages.append(ConfigStage(stage_id, tuple(agents)))
+        stages.append(ConfigStage(stage_id, tuple(agents), depends_on, when, repeat))
 
     if len(stages[-1].agents) != 1:
         raise ValueError("the final stage must contain exactly one agent")
-    return WorkflowConfig(1, tuple(stages))
+    if stages[-1].when or stages[-1].repeat:
+        raise ValueError("the final stage cannot be conditional or repeated")
+    return WorkflowConfig(version, tuple(stages))
 
 
 def load_config(path: Path) -> WorkflowConfig:
