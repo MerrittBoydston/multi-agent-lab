@@ -34,6 +34,7 @@ class ConfigStage:
     depends_on: tuple[str, ...] = ()
     when: dict[str, Any] | None = None
     repeat: dict[str, Any] | None = None
+    controls: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class WorkflowConfig:
                     **({"depends_on": list(stage.depends_on)} if self.version == 2 else {}),
                     **({"when": stage.when} if stage.when else {}),
                     **({"repeat": stage.repeat} if stage.repeat else {}),
+                    **({"controls": stage.controls} if stage.controls else {}),
                     "agents": [
                         {
                             "id": agent.agent_id,
@@ -105,7 +107,7 @@ def config_from_mapping(raw: Any) -> WorkflowConfig:
     agent_ids: set[str] = set()
     for stage_index, raw_stage in enumerate(raw_stages):
         location = f"stages[{stage_index}]"
-        allowed = {"id", "agents"} if version == 1 else {"id", "agents", "depends_on", "when", "repeat"}
+        allowed = {"id", "agents"} if version == 1 else {"id", "agents", "depends_on", "when", "repeat", "controls"}
         if not isinstance(raw_stage, dict) or not {"id", "agents"}.issubset(raw_stage) or set(raw_stage) - allowed:
             raise ValueError(f"{location} contains invalid stage fields")
         stage_id = _nonempty_string(raw_stage["id"], f"{location}.id")
@@ -124,6 +126,15 @@ def config_from_mapping(raw: Any) -> WorkflowConfig:
             raise ValueError(f"{location}.depends_on references unavailable stage {sorted(missing_dependencies)[0]!r}")
         when = raw_stage.get("when") if version == 2 else None
         repeat = raw_stage.get("repeat") if version == 2 else None
+        controls = raw_stage.get("controls") if version == 2 else None
+        if controls is not None:
+            allowed_controls = {"timeout_seconds", "max_retries", "max_output_chars"}
+            if not isinstance(controls, dict) or set(controls) - allowed_controls:
+                raise ValueError(f"{location}.controls contains unsupported fields")
+            for key, value in controls.items():
+                minimum = 0 if key == "max_retries" else 1
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or value < minimum:
+                    raise ValueError(f"{location}.controls.{key} must be at least {minimum}")
         for name, condition in (("when", when), ("repeat.until", repeat.get("until") if isinstance(repeat, dict) else None)):
             if condition is not None:
                 if not isinstance(condition, dict) or set(condition) != {"artifact", "field", "equals"}:
@@ -183,7 +194,7 @@ def config_from_mapping(raw: Any) -> WorkflowConfig:
             agents.append(agent)
             stage_slots.add((stage_id, agent_id))
         known_slots.update(stage_slots)
-        stages.append(ConfigStage(stage_id, tuple(agents), depends_on, when, repeat))
+        stages.append(ConfigStage(stage_id, tuple(agents), depends_on, when, repeat, controls))
 
     if len(stages[-1].agents) != 1:
         raise ValueError("the final stage must contain exactly one agent")

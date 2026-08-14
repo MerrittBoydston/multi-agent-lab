@@ -154,6 +154,18 @@ class CliTest(unittest.TestCase):
             self.assertEqual(retry_all.returncode, 0)
             self.assertEqual(retry_all.stdout, "No failed runs found.\n")
 
+    def test_cli_budget_exhaustion_and_cancellation_are_resumable(self):
+        with tempfile.TemporaryDirectory() as folder:
+            workspace = Path(folder)
+            exhausted = self.run_cli(workspace, "--max-tokens", "1", "Budget me")
+            self.assertEqual(exhausted.returncode, 1)
+            listed = self.run_cli(workspace, "--list-runs")
+            self.assertIn("budget_exhausted", listed.stdout)
+            run_id = listed.stdout.splitlines()[1].split()[0]
+            cancelled = self.run_cli(workspace, "--cancel", run_id)
+            self.assertEqual(cancelled.returncode, 0, cancelled.stderr)
+            self.assertIn("Cancelled run", cancelled.stdout)
+
     def test_timing_metrics_exclude_failed_to_resumed_downtime(self):
         start = datetime(2026, 1, 1, tzinfo=UTC)
         run = {
