@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from typing import Any
 
 
@@ -39,6 +40,16 @@ def schema_for_role(role: str) -> dict[str, Any]:
         "required": list(properties),
         "additionalProperties": False,
     }
+
+
+def schema_for_anthropic(role: str) -> dict[str, Any]:
+    """Return the role schema within Anthropic's supported raw JSON Schema subset."""
+    schema = deepcopy(schema_for_role(role))
+    confidence = schema["properties"]["confidence"]
+    confidence.pop("minimum", None)
+    confidence.pop("maximum", None)
+    confidence["description"] = "A confidence score from 0 to 1; validated locally."
+    return schema
 
 
 def _extract_json(text: str) -> dict[str, Any]:

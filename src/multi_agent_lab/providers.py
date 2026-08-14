@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from .models import AgentSpec, CompletionResult
-from .validation import schema_for_role
+from .validation import schema_for_anthropic, schema_for_role
 
 
 class AgentProvider(ABC):
@@ -66,7 +66,7 @@ class AnthropicProvider(AgentProvider):
             output_config={
                 "format": {
                     "type": "json_schema",
-                    "schema": schema_for_role(agent.role),
+                    "schema": schema_for_anthropic(agent.role),
                 }
             },
         ) as stream:

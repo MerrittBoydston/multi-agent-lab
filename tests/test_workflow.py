@@ -11,7 +11,12 @@ from unittest.mock import patch
 from multi_agent_lab.models import AgentSpec, CompletionResult
 from multi_agent_lab.providers import AnthropicProvider, MockProvider, OpenAIProvider
 from multi_agent_lab.workflow import CollaborationWorkflow, WorkflowInterrupted
-from multi_agent_lab.validation import OutputValidationError, schema_for_role, validate_output
+from multi_agent_lab.validation import (
+    OutputValidationError,
+    schema_for_anthropic,
+    schema_for_role,
+    validate_output,
+)
 
 
 class WorkflowTest(unittest.TestCase):
@@ -191,7 +196,10 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(result.output_tokens, 3)
         output_format = client.messages.kwargs["output_config"]["format"]
         self.assertEqual(output_format["type"], "json_schema")
-        self.assertEqual(output_format["schema"], schema_for_role("reviewer"))
+        self.assertEqual(output_format["schema"], schema_for_anthropic("reviewer"))
+        confidence = output_format["schema"]["properties"]["confidence"]
+        self.assertNotIn("minimum", confidence)
+        self.assertNotIn("maximum", confidence)
 
     def test_openai_provider_uses_strict_structured_output(self):
         class FakeResponses:
@@ -215,12 +223,21 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(output_format["type"], "json_schema")
         self.assertTrue(output_format["strict"])
         self.assertEqual(output_format["schema"], schema_for_role("critic"))
+        confidence = output_format["schema"]["properties"]["confidence"]
+        self.assertEqual(confidence["minimum"], 0)
+        self.assertEqual(confidence["maximum"], 1)
 
     def test_role_schemas_are_closed_and_fully_required(self):
         for role in ("producer", "critic", "reviewer"):
             schema = schema_for_role(role)
             self.assertFalse(schema["additionalProperties"])
             self.assertEqual(set(schema["required"]), set(schema["properties"]))
+
+    def test_anthropic_schema_keeps_local_range_constraint_unchanged(self):
+        anthropic_schema = schema_for_anthropic("producer")
+        local_schema = schema_for_role("producer")
+        self.assertNotIn("minimum", anthropic_schema["properties"]["confidence"])
+        self.assertEqual(local_schema["properties"]["confidence"]["minimum"], 0)
 
     def test_large_reviewer_input_is_compacted_and_audited(self):
         with tempfile.TemporaryDirectory() as folder, patch.dict("os.environ", {

@@ -66,6 +66,8 @@ Every agent response is validated as JSON against its role contract before it be
 
 Anthropic and OpenAI requests also use each provider's native JSON Schema output constraint. The schemas are shared with local validation so the provider contract and persisted-artifact contract stay aligned. Local validation and repair remain as defense in depth for refusals, unsupported provider models, or unexpected SDK behavior.
 
+Provider schema subsets are handled explicitly: OpenAI receives numeric confidence bounds, while Anthropic receives a compatible numeric field and the same 0–1 bound is enforced by local validation.
+
 Completed-agent events include provider, model, latency, retry and repair counts, and provider-reported token usage. `--show-run` aggregates wall-clock time, summed agent time, token usage, costs, and provider breakdowns.
 
 Optional cost estimates use configurable per-million-token rates. Precedence is per-agent (`REVIEWER_INPUT_COST_PER_MILLION`), per-model (`MODEL_CLAUDE_SONNET_4_6_INPUT_COST_PER_MILLION`), per-provider (`PROVIDER_ANTHROPIC_INPUT_COST_PER_MILLION`), then the global fallback (`AGENT_INPUT_COST_PER_MILLION`). Define matching output rates as well. Prices are intentionally not hard-coded because they change over time.
