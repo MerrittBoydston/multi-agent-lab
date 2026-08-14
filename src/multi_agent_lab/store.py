@@ -10,6 +10,10 @@ from typing import Iterator
 from .models import Artifact, utc_now
 
 
+class RunControlError(RuntimeError):
+    pass
+
+
 class RunStore:
     def __init__(self, root: Path):
         self.root = root
@@ -64,16 +68,86 @@ class RunStore:
             columns = {row["name"] for row in db.execute("PRAGMA table_info(runs)")}
             if "config_json" not in columns:
                 db.execute("ALTER TABLE runs ADD COLUMN config_json TEXT")
+            additions = {
+                "max_tokens": "INTEGER", "max_cost": "REAL", "deadline": "TEXT",
+                "used_tokens": "INTEGER NOT NULL DEFAULT 0", "used_cost": "REAL NOT NULL DEFAULT 0",
+                "reserved_tokens": "INTEGER NOT NULL DEFAULT 0", "reserved_cost": "REAL NOT NULL DEFAULT 0",
+                "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for name, definition in additions.items():
+                if name not in columns:
+                    db.execute(f"ALTER TABLE runs ADD COLUMN {name} {definition}")
 
-    def create_run(self, objective: str, config_json: str | None = None) -> str:
+    def create_run(self, objective: str, config_json: str | None = None, *, controls: dict | None = None) -> str:
         run_id = uuid.uuid4().hex[:12]
+        controls = controls or {}
         with self._connect() as db:
             db.execute(
-                "INSERT INTO runs (run_id, objective, status, created_at, completed_at, config_json) "
-                "VALUES (?, ?, ?, ?, NULL, ?)",
-                (run_id, objective, "running", utc_now(), config_json),
+                "INSERT INTO runs (run_id, objective, status, created_at, completed_at, config_json, "
+                "max_tokens, max_cost, deadline) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+                (run_id, objective, "running", utc_now(), config_json, controls.get("max_tokens"),
+                 controls.get("max_cost"), controls.get("deadline")),
             )
         return run_id
+
+    def reserve(self, run_id: str, tokens: int, cost: float | None) -> None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT status,max_tokens,max_cost,deadline,used_tokens,used_cost,reserved_tokens,"
+                "reserved_cost,cancel_requested FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if row["cancel_requested"] or row["status"] == "cancelled":
+                raise RunControlError("run was cancelled")
+            if row["deadline"] and utc_now() >= row["deadline"]:
+                raise RunControlError("run deadline was reached")
+            if row["max_tokens"] is not None and row["used_tokens"] + row["reserved_tokens"] + tokens > row["max_tokens"]:
+                raise RunControlError("token budget would be exceeded")
+            if row["max_cost"] is not None:
+                if cost is None:
+                    raise RunControlError("cost budget requires configured token pricing")
+                if row["used_cost"] + row["reserved_cost"] + cost > row["max_cost"]:
+                    raise RunControlError("cost budget would be exceeded")
+            cost = cost or 0.0
+            db.execute("UPDATE runs SET reserved_tokens=reserved_tokens+?, reserved_cost=reserved_cost+? WHERE run_id=?",
+                       (tokens, cost, run_id))
+
+    def reconcile(self, run_id: str, reserved_tokens: int, reserved_cost: float,
+                  used_tokens: int = 0, used_cost: float = 0) -> None:
+        with self._connect() as db:
+            db.execute(
+                "UPDATE runs SET reserved_tokens=MAX(0,reserved_tokens-?), reserved_cost=MAX(0,reserved_cost-?), "
+                "used_tokens=used_tokens+?, used_cost=used_cost+? WHERE run_id=?",
+                (reserved_tokens, reserved_cost, used_tokens, used_cost, run_id),
+            )
+
+    def cancel(self, run_id: str) -> None:
+        with self._connect() as db:
+            updated = db.execute(
+                "UPDATE runs SET cancel_requested=1,status='cancelled',completed_at=? "
+                "WHERE run_id=? AND status!='completed'", (utc_now(), run_id)
+            ).rowcount
+            if not updated:
+                raise ValueError(f"Run {run_id!r} does not exist or is already completed")
+            db.execute("INSERT INTO events (run_id,stage,agent_id,event_type,payload_json,created_at) "
+                       "VALUES (?,'workflow',NULL,'cancelled','{}',?)", (run_id, utc_now()))
+
+    def controls(self, run_id: str):
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT max_tokens,max_cost,deadline,used_tokens,used_cost,reserved_tokens,reserved_cost,"
+                "cancel_requested FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"Run {run_id!r} does not exist")
+        return row
+
+    def configure_controls(self, run_id: str, controls: dict) -> None:
+        values = [(name, controls[name]) for name in ("max_tokens", "max_cost", "deadline") if controls.get(name) is not None]
+        if values:
+            with self._connect() as db:
+                db.execute("UPDATE runs SET " + ",".join(f"{name}=?" for name, _ in values) + " WHERE run_id=?",
+                           tuple(value for _, value in values) + (run_id,))
 
     def resume_run(self, run_id: str) -> str:
         with self._connect() as db:
@@ -85,7 +159,7 @@ class RunStore:
             if row["status"] == "completed":
                 raise ValueError(f"Run {run_id!r} is already completed")
             db.execute(
-                "UPDATE runs SET status = 'running', completed_at = NULL WHERE run_id = ?",
+                "UPDATE runs SET status = 'running', completed_at = NULL, cancel_requested = 0 WHERE run_id = ?",
                 (run_id,),
             )
             db.execute(
@@ -106,7 +180,7 @@ class RunStore:
         order = "DESC" if newest_first else "ASC"
         with self._connect() as db:
             rows = db.execute(
-                f"SELECT run_id FROM runs WHERE status = 'failed' ORDER BY created_at {order}"
+                f"SELECT run_id FROM runs WHERE status IN ('failed','budget_exhausted','cancelled') ORDER BY created_at {order}"
             ).fetchall()
         return [str(row["run_id"]) for row in rows]
 
@@ -170,6 +244,6 @@ class RunStore:
     def finish(self, run_id: str, status: str = "completed") -> None:
         with self._connect() as db:
             db.execute(
-                "UPDATE runs SET status = ?, completed_at = ? WHERE run_id = ?",
+                "UPDATE runs SET status = ?, completed_at = ?, reserved_tokens=0, reserved_cost=0 WHERE run_id = ?",
                 (status, utc_now(), run_id),
             )

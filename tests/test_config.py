@@ -70,6 +70,17 @@ class ConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "final stage"):
             config_from_mapping(ambiguous)
 
+    def test_validates_stage_controls(self):
+        configured = valid_config()
+        configured["version"] = 2
+        configured["stages"][0]["controls"] = {
+            "timeout_seconds": 30, "max_retries": 0, "max_output_chars": 1000
+        }
+        self.assertEqual(config_from_mapping(configured).stages[0].controls["max_retries"], 0)
+        configured["stages"][0]["controls"]["max_output_chars"] = 0
+        with self.assertRaisesRegex(ValueError, "max_output_chars"):
+            config_from_mapping(configured)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -146,6 +146,38 @@ a stage name such as `revision--iteration-2`, and
 `loop_iteration_completed` records whether its stop condition fired. Resume
 reuses those iteration artifacts and continues only missing bounded work.
 
+## Operational controls
+
+Bound a new run—or replace limits while resuming—with conservative token,
+estimated-cost, and absolute deadline controls:
+
+```bash
+multi-agent-lab --max-tokens 250000 --max-cost 1.50 \
+  --deadline 2026-08-15T18:00:00Z "Evaluate this objective"
+```
+
+Before every parallel provider call, the runner atomically reserves a
+worst-case allowance covering retries and one repair. Actual provider usage is
+reconciled afterward. Cost budgets require the existing per-agent, per-model,
+per-provider, or global pricing environment variables. A rejected reservation
+sets the resumable `budget_exhausted` status and preserves completed artifacts.
+
+Version-2 YAML stages may override `timeout_seconds`, `max_retries`, and
+`max_output_chars`:
+
+```yaml
+controls:
+  timeout_seconds: 45
+  max_retries: 2
+  max_output_chars: 12000
+```
+
+Request a cooperative cancellation from another process with
+`multi-agent-lab --workspace .multi-agent-lab --cancel RUN_ID`. An in-flight
+provider request may finish, but no subsequent call or workflow completion is
+allowed. Cancelled runs remain resumable. Resume previews include remaining
+token and cost allowances.
+
 Transient provider failures (connection errors, timeouts, rate limits, and server errors) are retried three times with exponential backoff. Configure this behavior with `AGENT_MAX_RETRIES` and `AGENT_RETRY_DELAY_SECONDS`; each retry is recorded as an `agent_retrying` audit event.
 
 Anthropic responses use streaming so long generations continue sending data instead of leaving an idle HTTP connection open.

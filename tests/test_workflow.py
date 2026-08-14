@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,6 +12,7 @@ from unittest.mock import patch
 from multi_agent_lab.config import config_from_mapping, load_config
 from multi_agent_lab.models import AgentSpec, CompletionResult
 from multi_agent_lab.providers import AnthropicProvider, MockProvider, OpenAIProvider
+from multi_agent_lab.store import RunControlError
 from multi_agent_lab.workflow import CollaborationWorkflow, WorkflowInterrupted
 from multi_agent_lab.validation import (
     OutputValidationError,
@@ -21,6 +23,31 @@ from multi_agent_lab.validation import (
 
 
 class WorkflowTest(unittest.TestCase):
+    def test_atomic_parallel_reservations_cannot_exceed_budget(self):
+        with tempfile.TemporaryDirectory() as folder:
+            workflow = CollaborationWorkflow(Path(folder))
+            run_id = workflow.store.create_run("Atomic", controls={"max_tokens": 100})
+            def reserve():
+                try:
+                    workflow.store.reserve(run_id, 60, 0)
+                    return True
+                except RunControlError:
+                    return False
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                outcomes = list(pool.map(lambda _: reserve(), range(2)))
+            self.assertEqual(sorted(outcomes), [False, True])
+            self.assertEqual(workflow.store.controls(run_id)["reserved_tokens"], 60)
+
+    def test_budget_exhaustion_is_resumable_and_preserves_no_partial_call(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict("os.environ", {"AGENT_PROVIDER": "mock"}):
+            workflow = CollaborationWorkflow(Path(folder))
+            with self.assertRaisesRegex(RunControlError, "token budget"):
+                asyncio.run(workflow.run("Too small", controls={"max_tokens": 1}))
+            run_id = workflow.store.failed_run_ids()[0]
+            run, artifacts, _ = workflow.store.run_details(run_id)
+            self.assertEqual(run["status"], "budget_exhausted")
+            self.assertEqual(artifacts, [])
+
     def test_conditional_bounded_loop_preserves_iterations_and_decisions(self):
         config = load_config(Path(__file__).parents[1] / "examples" / "conditional-workflow.yml")
         with tempfile.TemporaryDirectory() as folder:

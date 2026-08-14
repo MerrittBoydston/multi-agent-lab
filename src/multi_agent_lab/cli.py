@@ -5,7 +5,7 @@ import asyncio
 import json
 import sys
 from collections import defaultdict
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .config import WorkflowConfig, load_config
@@ -56,6 +56,12 @@ def _show_run(workflow: CollaborationWorkflow, run_id: str) -> None:
     print(f"Completed: {run['completed_at'] or '-'}")
     print(f"Objective: {run['objective']}")
     print(f"Configuration: {'stored snapshot' if run['config_json'] else 'legacy default'}")
+    controls = workflow.store.controls(run_id)
+    if any(controls[name] is not None for name in ("max_tokens", "max_cost", "deadline")):
+        print("Controls:")
+        print(f"  Token budget: {controls['used_tokens']}/{controls['max_tokens'] or '-'}")
+        print(f"  Cost budget: ${controls['used_cost']:.6f}/{controls['max_cost'] if controls['max_cost'] is not None else '-'}")
+        print(f"  Deadline: {controls['deadline'] or '-'}")
     if completed_metrics:
         duration = sum(item["duration_seconds"] for item in completed_metrics)
         retries = sum(item["retries"] for item in completed_metrics)
@@ -120,19 +126,25 @@ def _print_resume_plan(
     print(f"Resume plan for {run_id}:", file=sys.stderr)
     print(f"  Reuse: {format_slots(reused)}", file=sys.stderr)
     print(f"  Execute: {format_slots(missing)}", file=sys.stderr)
+    controls = workflow.store.controls(run_id)
+    if controls["max_tokens"] is not None:
+        print(f"  Tokens remaining: {controls['max_tokens'] - controls['used_tokens']}", file=sys.stderr)
+    if controls["max_cost"] is not None:
+        print(f"  Cost remaining: ${controls['max_cost'] - controls['used_cost']:.6f}", file=sys.stderr)
 
 
 async def _resume_many(
     workflow: CollaborationWorkflow,
     run_ids: list[str],
     config: WorkflowConfig | None = None,
+    controls: dict | None = None,
 ) -> list[WorkflowResult]:
     results = []
     failures = []
     for run_id in run_ids:
         _print_resume_plan(workflow, run_id, config)
         try:
-            results.append(await workflow.run(resume_id=run_id, config=config))
+            results.append(await workflow.run(resume_id=run_id, config=config, controls=controls))
         except WorkflowInterrupted:
             raise
         except Exception as exc:
@@ -155,17 +167,33 @@ def main() -> None:
     parser.add_argument("--retry-failed", action="store_true", help="Resume all failed runs, oldest first")
     parser.add_argument("--list-runs", action="store_true", help="List runs in the workspace")
     parser.add_argument("--show-run", metavar="RUN_ID", help="Show a run's artifacts and audit events")
+    parser.add_argument("--cancel", metavar="RUN_ID", help="Request cancellation of a resumable run")
+    parser.add_argument("--max-tokens", type=int, help="Maximum reserved and consumed tokens")
+    parser.add_argument("--max-cost", type=float, help="Maximum estimated cost in USD")
+    parser.add_argument("--deadline", help="Absolute ISO-8601 UTC deadline")
     args = parser.parse_args()
 
     selected = sum((
         bool(args.objective), bool(args.resume), args.resume_latest, args.retry_failed,
-        args.list_runs, bool(args.show_run), args.dry_run,
+        args.list_runs, bool(args.show_run), args.dry_run, bool(args.cancel),
     ))
     if selected != 1:
         parser.error(
             "provide exactly one of an objective, --resume RUN_ID, --resume-latest, "
-            "--retry-failed, --list-runs, --show-run RUN_ID, or --dry-run"
+            "--retry-failed, --list-runs, --show-run RUN_ID, --cancel RUN_ID, or --dry-run"
         )
+    if args.max_tokens is not None and args.max_tokens <= 0:
+        parser.error("--max-tokens must be positive")
+    if args.max_cost is not None and args.max_cost <= 0:
+        parser.error("--max-cost must be positive")
+    if args.deadline:
+        try:
+            deadline = datetime.fromisoformat(args.deadline.replace("Z", "+00:00"))
+            if deadline.tzinfo is None:
+                raise ValueError
+            args.deadline = deadline.astimezone(UTC).isoformat()
+        except ValueError:
+            parser.error("--deadline must be an ISO-8601 timestamp with a timezone")
     if args.dry_run and not args.config:
         parser.error("--dry-run requires --config PATH")
     if args.config and (args.list_runs or args.show_run):
@@ -174,6 +202,11 @@ def main() -> None:
     try:
         workflow = CollaborationWorkflow(args.workspace, progress=lambda message: print(message, file=sys.stderr, flush=True))
         config = load_config(args.config) if args.config else None
+        controls = {"max_tokens": args.max_tokens, "max_cost": args.max_cost, "deadline": args.deadline}
+        if args.cancel:
+            workflow.store.cancel(args.cancel)
+            print(f"Cancelled run: {args.cancel}")
+            return
         if args.dry_run:
             print(workflow.describe(config))
             return
@@ -193,14 +226,14 @@ def main() -> None:
             if not failed:
                 print("No failed runs found.")
                 return
-            results = asyncio.run(_resume_many(workflow, failed, config))
+            results = asyncio.run(_resume_many(workflow, failed, config, controls))
             for result in results:
                 print(f"Run: {result.run_id}")
                 print(f"Final artifact: {result.final_artifact.path}")
             return
         if args.resume:
             _print_resume_plan(workflow, args.resume, config)
-        result = asyncio.run(workflow.run(args.objective, resume_id=args.resume, config=config))
+        result = asyncio.run(workflow.run(args.objective, resume_id=args.resume, config=config, controls=controls))
     except WorkflowInterrupted as exc:
         print(f"\nRun {exc.run_id} was interrupted; completed artifacts were preserved.")
         print(

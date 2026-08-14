@@ -13,7 +13,7 @@ from typing import Callable
 from .config import OBJECTIVE_PATTERN, PREVIOUS_PATTERN, REFERENCE_PATTERN, WorkflowConfig, config_from_mapping
 from .models import AgentSpec, Artifact
 from .providers import bounded_completion, provider_for
-from .store import RunStore
+from .store import RunControlError, RunStore
 from .validation import OutputValidationError, validate_output
 
 
@@ -54,8 +54,8 @@ class CollaborationWorkflow:
         run, _, _ = self.store.run_details(run_id)
         if run["status"] == "completed":
             raise ValueError(f"Run {run_id!r} is already completed")
-        if run["status"] != "failed":
-            raise ValueError(f"Run {run_id!r} is {run['status']!r}, not failed")
+        if run["status"] not in {"failed", "budget_exhausted", "cancelled"}:
+            raise ValueError(f"Run {run_id!r} is {run['status']!r}, not resumable")
         config = self._config_for_run(run, requested_config)
         completed = self._with_iteration_aliases(self.store.artifacts_for_run(run_id))
         reused = [slot for slot in config.slots if slot in completed]
@@ -156,7 +156,21 @@ class CollaborationWorkflow:
             raise ValueError(f"Set {prefix}_MODEL for provider {provider}")
         return AgentSpec(agent_id, role, provider, model, prompt)
 
-    async def _call(self, run_id: str, stage: str, agent: AgentSpec, prompt: str) -> Artifact:
+    async def _call(self, run_id: str, stage: str, agent: AgentSpec, prompt: str, controls: dict | None = None) -> Artifact:
+        controls = controls or {}
+        max_retries = int(controls.get("max_retries", self.max_retries))
+        timeout = float(controls.get("timeout_seconds", self.timeout))
+        max_output = int(controls.get("max_output_chars", self.max_output))
+        attempts_reserved = max_retries + 2
+        input_ceiling = max(1, len(prompt) + len(agent.system_prompt) + max_output)
+        output_ceiling = max(1, max_output)
+        reserved_tokens = attempts_reserved * (input_ceiling + output_ceiling)
+        reserved_cost = self._estimated_cost(
+            agent,
+            attempts_reserved * input_ceiling,
+            attempts_reserved * output_ceiling,
+        )
+        self.store.reserve(run_id, reserved_tokens, reserved_cost)
         started_at = time.perf_counter()
         retries = 0
         repairs = 0
@@ -165,18 +179,18 @@ class CollaborationWorkflow:
         usage_reported = False
         self.progress(f"[{run_id}] {stage}: starting {agent.agent_id} ({agent.provider}/{agent.model})")
         self.store.event(run_id, stage, "agent_started", {"provider": agent.provider, "model": agent.model}, agent.agent_id)
-        for attempt in range(self.max_retries + 1):
+        for attempt in range(max_retries + 1):
             try:
                 completion = await bounded_completion(
                     provider_for(agent.provider), agent, prompt,
-                    timeout_seconds=self.timeout, max_output_chars=self.max_output,
+                    timeout_seconds=timeout, max_output_chars=max_output,
                 )
                 input_tokens += completion.input_tokens or 0
                 output_tokens += completion.output_tokens or 0
                 usage_reported = usage_reported or completion.input_tokens is not None or completion.output_tokens is not None
                 break
             except Exception as exc:
-                if attempt >= self.max_retries or not self._is_transient(exc):
+                if attempt >= max_retries or not self._is_transient(exc):
                     raise
                 delay = self.retry_delay * (2 ** attempt)
                 retries += 1
@@ -186,7 +200,7 @@ class CollaborationWorkflow:
                     "agent_retrying",
                     {
                         "attempt": attempt + 1,
-                        "max_retries": self.max_retries,
+                        "max_retries": max_retries,
                         "delay_seconds": delay,
                         "error": type(exc).__name__,
                         "message": str(exc),
@@ -194,7 +208,7 @@ class CollaborationWorkflow:
                     agent.agent_id,
                 )
                 self.progress(
-                    f"[{run_id}] {stage}: {agent.agent_id} retry {attempt + 1}/{self.max_retries} "
+                    f"[{run_id}] {stage}: {agent.agent_id} retry {attempt + 1}/{max_retries} "
                     f"in {delay:g}s ({type(exc).__name__})"
                 )
                 await asyncio.sleep(delay)
@@ -212,7 +226,7 @@ class CollaborationWorkflow:
             )
             repaired = await bounded_completion(
                 provider_for(agent.provider), agent, repair_prompt,
-                timeout_seconds=self.timeout, max_output_chars=self.max_output,
+                timeout_seconds=timeout, max_output_chars=max_output,
             )
             input_tokens += repaired.input_tokens or 0
             output_tokens += repaired.output_tokens or 0
@@ -245,6 +259,9 @@ class CollaborationWorkflow:
             run_id, stage, "agent_completed",
             {"artifact_id": artifact.artifact_id, "metrics": metrics}, agent.agent_id,
         )
+        used_tokens = input_tokens + output_tokens if usage_reported else reserved_tokens
+        used_cost = estimated_cost if estimated_cost is not None else (reserved_cost or 0.0)
+        self.store.reconcile(run_id, reserved_tokens, reserved_cost or 0.0, used_tokens, used_cost)
         self.progress(f"[{run_id}] {stage}: completed {agent.agent_id}")
         return artifact
 
@@ -446,6 +463,7 @@ class CollaborationWorkflow:
         *,
         resume_id: str | None = None,
         config: WorkflowConfig | None = None,
+        controls: dict | None = None,
     ) -> WorkflowResult:
         if resume_id is not None:
             if objective is not None:
@@ -454,6 +472,7 @@ class CollaborationWorkflow:
             run, _, _ = self.store.run_details(run_id)
             effective_config = self._config_for_run(run, config)
             self._validate_runtime_config(effective_config)
+            self.store.configure_controls(run_id, controls or {})
             objective = self.store.resume_run(run_id)
             self.progress(f"[{run_id}] resuming run")
         else:
@@ -461,7 +480,7 @@ class CollaborationWorkflow:
                 raise ValueError("An objective is required for a new run")
             effective_config = config or self._default_config()
             self._validate_runtime_config(effective_config)
-            run_id = self.store.create_run(objective, effective_config.to_json())
+            run_id = self.store.create_run(objective, effective_config.to_json(), controls=controls)
             self.progress(f"[{run_id}] created run")
         try:
             completed = self.store.artifacts_for_run(run_id)
@@ -525,7 +544,7 @@ class CollaborationWorkflow:
                                 {"original_chars": original_chars, "compacted_chars": len(prompt),
                                  "max_chars": self.reviewer_input_limit}, agent.agent_id,
                             )
-                        calls.append(self._call(run_id, persisted_stage, agent, prompt))
+                        calls.append(self._call(run_id, persisted_stage, agent, prompt, stage.controls))
                     if calls:
                         await self._complete_stage(calls)
                         completed = self._with_iteration_aliases(self.store.artifacts_for_run(run_id))
@@ -540,6 +559,7 @@ class CollaborationWorkflow:
             final_stage = effective_config.stages[-1]
             final_agent = final_stage.agents[0]
             final_artifact = completed[(final_stage.stage_id, final_agent.agent_id)]
+            self.store.reserve(run_id, 0, 0)
             self.store.finish(run_id)
             self.progress(f"[{run_id}] workflow completed")
             return WorkflowResult(run_id, final_artifact)
@@ -547,6 +567,10 @@ class CollaborationWorkflow:
             self.store.event(run_id, "workflow", "interrupted", {})
             self.store.finish(run_id, "failed")
             raise WorkflowInterrupted(run_id) from None
+        except RunControlError as exc:
+            self.store.event(run_id, "workflow", "budget_exhausted", {"message": str(exc)})
+            self.store.finish(run_id, "cancelled" if "cancel" in str(exc) else "budget_exhausted")
+            raise
         except Exception as exc:
             self.store.event(run_id, "workflow", "failed", {"error": type(exc).__name__, "message": str(exc)})
             self.store.finish(run_id, "failed")
