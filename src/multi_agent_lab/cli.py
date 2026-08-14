@@ -149,6 +149,7 @@ def main() -> None:
     parser.add_argument("objective", nargs="?", help="The topic or deliverable to work on")
     parser.add_argument("--workspace", type=Path, default=Path(".multi-agent-lab"))
     parser.add_argument("--config", type=Path, help="YAML workflow configuration for a new run or resume verification")
+    parser.add_argument("--dry-run", action="store_true", help="Validate and display a configuration without calling models")
     parser.add_argument("--resume", metavar="RUN_ID", help="Resume a failed run, executing only missing stages")
     parser.add_argument("--resume-latest", action="store_true", help="Resume the newest failed run")
     parser.add_argument("--retry-failed", action="store_true", help="Resume all failed runs, oldest first")
@@ -158,19 +159,24 @@ def main() -> None:
 
     selected = sum((
         bool(args.objective), bool(args.resume), args.resume_latest, args.retry_failed,
-        args.list_runs, bool(args.show_run),
+        args.list_runs, bool(args.show_run), args.dry_run,
     ))
     if selected != 1:
         parser.error(
             "provide exactly one of an objective, --resume RUN_ID, --resume-latest, "
-            "--retry-failed, --list-runs, or --show-run RUN_ID"
+            "--retry-failed, --list-runs, --show-run RUN_ID, or --dry-run"
         )
+    if args.dry_run and not args.config:
+        parser.error("--dry-run requires --config PATH")
     if args.config and (args.list_runs or args.show_run):
         parser.error("--config can only be used when starting or resuming runs")
 
     try:
         workflow = CollaborationWorkflow(args.workspace, progress=lambda message: print(message, file=sys.stderr, flush=True))
         config = load_config(args.config) if args.config else None
+        if args.dry_run:
+            print(workflow.describe(config))
+            return
         if args.list_runs:
             _print_runs(workflow)
             return

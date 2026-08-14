@@ -1,0 +1,53 @@
+version: 2
+stages:
+  - id: proposal
+    agents:
+      - id: writer
+        role: producer
+        provider: mock
+        model: mock-v1
+        system_prompt: Produce a concrete proposal.
+        input: "{{ objective }}"
+  - id: critique
+    depends_on: [proposal]
+    agents:
+      - id: critic
+        role: critic
+        provider: mock
+        model: mock-v1
+        system_prompt: Critique the proposal.
+        input: "{{ artifact.proposal.writer }}"
+  - id: revision
+    depends_on: [critique]
+    when:
+      artifact: critique/critic
+      field: recommendation
+      equals: revise
+    repeat:
+      max_iterations: 3
+      until:
+        artifact: revision/reviser
+        field: confidence
+        equals: 0.9
+    agents:
+      - id: reviser
+        role: producer
+        provider: mock
+        model: mock-v1
+        system_prompt: Revise the proposal using the prior attempt.
+        input: |-
+          OBJECTIVE: {{ objective }}
+          ORIGINAL: {{ artifact.proposal.writer }}
+          PREVIOUS REVISION: {{ previous }}
+  - id: final
+    depends_on: [proposal, critique, revision]
+    agents:
+      - id: reviewer
+        role: reviewer
+        provider: mock
+        model: mock-v1
+        system_prompt: Produce the final decision.
+        input: |-
+          {{ artifact.proposal.writer }}
+          {{ artifact.critique.critic }}
+          {{ artifact.revision.reviser }}

@@ -72,6 +72,16 @@ class CliTest(unittest.TestCase):
             self.assertEqual(shown.returncode, 0, shown.stderr)
             self.assertIn("Configuration: stored snapshot", shown.stdout)
 
+    def test_dry_run_validates_and_displays_graph_without_workspace_run(self):
+        with tempfile.TemporaryDirectory() as folder:
+            workspace = Path(folder)
+            config = Path(__file__).parents[1] / "examples" / "conditional-workflow.yml"
+            result = self.run_cli(workspace, "--config", str(config), "--dry-run")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Workflow graph (version 2)", result.stdout)
+            self.assertIn("revision <- critique", result.stdout)
+            self.assertEqual(self.run_cli(workspace, "--list-runs").stdout, "No runs found.\n")
+
     def test_errors_are_concise(self):
         with tempfile.TemporaryDirectory() as folder:
             result = self.run_cli(Path(folder), "--resume", "missing")
