@@ -11,6 +11,26 @@ from pathlib import Path
 from .workflow import CollaborationWorkflow, WorkflowInterrupted
 
 
+def _timing_metrics(run, events) -> tuple[float, float, float] | None:
+    if not run["completed_at"]:
+        return None
+    created = datetime.fromisoformat(run["created_at"])
+    completed = datetime.fromisoformat(run["completed_at"])
+    lifecycle = max(0.0, (completed - created).total_seconds())
+    stopped_at = None
+    downtime = 0.0
+    for event in events:
+        event_type = event["event_type"]
+        event_time = datetime.fromisoformat(event["created_at"])
+        if event_type in {"failed", "interrupted"} and stopped_at is None:
+            stopped_at = event_time
+        elif event_type == "resumed" and stopped_at is not None:
+            downtime += max(0.0, (event_time - stopped_at).total_seconds())
+            stopped_at = None
+    downtime = min(downtime, lifecycle)
+    return lifecycle, lifecycle - downtime, downtime
+
+
 def _print_runs(workflow: CollaborationWorkflow) -> None:
     rows = workflow.store.list_runs()
     if not rows:
@@ -40,12 +60,12 @@ def _show_run(workflow: CollaborationWorkflow, run_id: str) -> None:
         repairs = sum(item["repairs"] for item in completed_metrics)
         token_metrics = [item for item in completed_metrics if item["input_tokens"] is not None]
         print("\nMetrics:")
-        if run["completed_at"]:
-            wall_time = (
-                datetime.fromisoformat(run["completed_at"])
-                - datetime.fromisoformat(run["created_at"])
-            ).total_seconds()
-            print(f"  Wall time: {wall_time:.3f}s")
+        timing = _timing_metrics(run, events)
+        if timing:
+            lifecycle, active, downtime = timing
+            print(f"  Lifecycle time: {lifecycle:.3f}s")
+            print(f"  Active wall time: {active:.3f}s")
+            print(f"  Downtime: {downtime:.3f}s")
         print(f"  Agent time: {duration:.3f}s")
         print(f"  Retries: {retries}")
         print(f"  Repairs: {repairs}")

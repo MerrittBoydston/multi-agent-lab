@@ -68,7 +68,7 @@ Anthropic and OpenAI requests also use each provider's native JSON Schema output
 
 Provider schema subsets are handled explicitly: OpenAI receives numeric confidence bounds, while Anthropic receives a compatible numeric field and the same 0–1 bound is enforced by local validation.
 
-Completed-agent events include provider, model, latency, retry and repair counts, and provider-reported token usage. `--show-run` aggregates wall-clock time, summed agent time, token usage, costs, and provider breakdowns.
+Completed-agent events include provider, model, latency, retry and repair counts, and provider-reported token usage. `--show-run` separates total lifecycle time, active wall time, downtime awaiting resume, and summed agent time, then aggregates token usage, costs, and provider breakdowns. Timing is derived from existing failure, interruption, and resume audit events, so older resumed runs are supported.
 
 Optional cost estimates use configurable per-million-token rates. Precedence is per-agent (`REVIEWER_INPUT_COST_PER_MILLION`), per-model (`MODEL_CLAUDE_SONNET_4_6_INPUT_COST_PER_MILLION`), per-provider (`PROVIDER_ANTHROPIC_INPUT_COST_PER_MILLION`), then the global fallback (`AGENT_INPUT_COST_PER_MILLION`). Define matching output rates as well. Prices are intentionally not hard-coded because they change over time.
 

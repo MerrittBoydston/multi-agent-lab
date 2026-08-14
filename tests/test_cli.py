@@ -3,7 +3,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+from multi_agent_lab.cli import _timing_metrics
 
 
 class CliTest(unittest.TestCase):
@@ -44,7 +47,9 @@ class CliTest(unittest.TestCase):
             self.assertIn("final/reviewer", shown.stdout)
             self.assertIn("agent_completed", shown.stdout)
             self.assertIn("Metrics:", shown.stdout)
-            self.assertIn("Wall time:", shown.stdout)
+            self.assertIn("Lifecycle time:", shown.stdout)
+            self.assertIn("Active wall time:", shown.stdout)
+            self.assertIn("Downtime: 0.000s", shown.stdout)
             self.assertIn("Agent time:", shown.stdout)
             self.assertIn("Retries: 0", shown.stdout)
             self.assertIn("Providers/models:", shown.stdout)
@@ -64,6 +69,32 @@ class CliTest(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("Error: Run 'missing' does not exist", result.stderr)
             self.assertNotIn("Traceback", result.stderr)
+
+    def test_timing_metrics_exclude_failed_to_resumed_downtime(self):
+        start = datetime(2026, 1, 1, tzinfo=UTC)
+        run = {
+            "created_at": start.isoformat(),
+            "completed_at": (start + timedelta(seconds=120)).isoformat(),
+        }
+        events = [
+            {"event_type": "failed", "created_at": (start + timedelta(seconds=10)).isoformat()},
+            {"event_type": "resumed", "created_at": (start + timedelta(seconds=80)).isoformat()},
+        ]
+        self.assertEqual(_timing_metrics(run, events), (120.0, 50.0, 70.0))
+
+    def test_timing_metrics_handle_multiple_interruptions(self):
+        start = datetime(2026, 1, 1, tzinfo=UTC)
+        run = {
+            "created_at": start.isoformat(),
+            "completed_at": (start + timedelta(seconds=100)).isoformat(),
+        }
+        events = [
+            {"event_type": "interrupted", "created_at": (start + timedelta(seconds=10)).isoformat()},
+            {"event_type": "resumed", "created_at": (start + timedelta(seconds=30)).isoformat()},
+            {"event_type": "failed", "created_at": (start + timedelta(seconds=50)).isoformat()},
+            {"event_type": "resumed", "created_at": (start + timedelta(seconds=90)).isoformat()},
+        ]
+        self.assertEqual(_timing_metrics(run, events), (100.0, 40.0, 60.0))
 
 
 if __name__ == "__main__":
