@@ -12,6 +12,10 @@ A small local reference implementation of a controlled multi-agent environment:
 
 The workflow is deterministic; the agents inside each step can come from different providers.
 
+Multi-Agent Lab is released under the [MIT License](LICENSE). Contributions are
+welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Report security issues privately
+as described in [SECURITY.md](SECURITY.md).
+
 ## Step 1 — run it safely with mock agents
 
 No API key or package installation is needed:
