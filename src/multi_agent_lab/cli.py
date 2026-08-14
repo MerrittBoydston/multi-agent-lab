@@ -4,6 +4,8 @@ import argparse
 import asyncio
 import json
 import sys
+from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 from .workflow import CollaborationWorkflow, WorkflowInterrupted
@@ -38,6 +40,12 @@ def _show_run(workflow: CollaborationWorkflow, run_id: str) -> None:
         repairs = sum(item["repairs"] for item in completed_metrics)
         token_metrics = [item for item in completed_metrics if item["input_tokens"] is not None]
         print("\nMetrics:")
+        if run["completed_at"]:
+            wall_time = (
+                datetime.fromisoformat(run["completed_at"])
+                - datetime.fromisoformat(run["created_at"])
+            ).total_seconds()
+            print(f"  Wall time: {wall_time:.3f}s")
         print(f"  Agent time: {duration:.3f}s")
         print(f"  Retries: {retries}")
         print(f"  Repairs: {repairs}")
@@ -48,6 +56,23 @@ def _show_run(workflow: CollaborationWorkflow, run_id: str) -> None:
         costs = [item.get("estimated_cost_usd") for item in completed_metrics]
         if costs and all(cost is not None for cost in costs):
             print(f"  Estimated cost: ${sum(costs):.6f}")
+        provider_totals = defaultdict(lambda: {"agents": 0, "input": 0, "output": 0, "cost": 0.0, "cost_complete": True})
+        for item in completed_metrics:
+            provider = item.get("provider", "unknown")
+            model = item.get("model", "unknown")
+            total = provider_totals[(provider, model)]
+            total["agents"] += 1
+            total["input"] += item.get("input_tokens") or 0
+            total["output"] += item.get("output_tokens") or 0
+            if item.get("estimated_cost_usd") is None:
+                total["cost_complete"] = False
+            else:
+                total["cost"] += item["estimated_cost_usd"]
+        print("  Providers/models:")
+        for (provider, model), total in sorted(provider_totals.items()):
+            usage = f"{total['input']} in / {total['output']} out"
+            cost = f", ${total['cost']:.6f}" if total["cost_complete"] else ""
+            print(f"    {provider}/{model}: {total['agents']} agents, {usage}{cost}")
     print("\nArtifacts:")
     if not artifacts:
         print("  None")

@@ -64,7 +64,9 @@ Reviewer inputs are capped at 16,000 characters by default. If proposals and cri
 
 Every agent response is validated as JSON against its role contract before it becomes an artifact. Malformed output receives one bounded repair attempt. Repair attempts and outcomes are recorded as `output_repairing`, `output_repaired`, or `output_repair_failed` events; a second invalid response fails the run without saving it.
 
-Completed-agent events include latency, retry and repair counts, and provider-reported token usage. `--show-run` aggregates these metrics. Optional cost estimates use `AGENT_INPUT_COST_PER_MILLION` and `AGENT_OUTPUT_COST_PER_MILLION`, with per-agent overrides such as `REVIEWER_INPUT_COST_PER_MILLION`; prices are intentionally configuration rather than hard-coded data.
+Completed-agent events include provider, model, latency, retry and repair counts, and provider-reported token usage. `--show-run` aggregates wall-clock time, summed agent time, token usage, costs, and provider breakdowns.
+
+Optional cost estimates use configurable per-million-token rates. Precedence is per-agent (`REVIEWER_INPUT_COST_PER_MILLION`), per-model (`MODEL_CLAUDE_SONNET_4_6_INPUT_COST_PER_MILLION`), per-provider (`PROVIDER_ANTHROPIC_INPUT_COST_PER_MILLION`), then the global fallback (`AGENT_INPUT_COST_PER_MILLION`). Define matching output rates as well. Prices are intentionally not hard-coded because they change over time.
 
 ## Step 2 — connect one real provider
 

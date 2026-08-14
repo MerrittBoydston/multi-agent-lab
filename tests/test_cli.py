@@ -44,8 +44,11 @@ class CliTest(unittest.TestCase):
             self.assertIn("final/reviewer", shown.stdout)
             self.assertIn("agent_completed", shown.stdout)
             self.assertIn("Metrics:", shown.stdout)
+            self.assertIn("Wall time:", shown.stdout)
             self.assertIn("Agent time:", shown.stdout)
             self.assertIn("Retries: 0", shown.stdout)
+            self.assertIn("Providers/models:", shown.stdout)
+            self.assertIn("mock/mock-v1: 5 agents", shown.stdout)
 
     def test_errors_are_concise(self):
         with tempfile.TemporaryDirectory() as folder:

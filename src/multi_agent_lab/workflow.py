@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -129,6 +130,8 @@ class CollaborationWorkflow:
         artifact = self.store.artifact(run_id, stage, agent.agent_id, result)
         duration = time.perf_counter() - started_at
         metrics = {
+            "provider": agent.provider,
+            "model": agent.model,
             "duration_seconds": round(duration, 6),
             "retries": retries,
             "repairs": repairs,
@@ -147,9 +150,21 @@ class CollaborationWorkflow:
 
     @staticmethod
     def _estimated_cost(agent: AgentSpec, input_tokens: int, output_tokens: int) -> float | None:
-        prefix = agent.agent_id.upper().replace("-", "_")
-        input_rate = os.getenv(f"{prefix}_INPUT_COST_PER_MILLION", os.getenv("AGENT_INPUT_COST_PER_MILLION"))
-        output_rate = os.getenv(f"{prefix}_OUTPUT_COST_PER_MILLION", os.getenv("AGENT_OUTPUT_COST_PER_MILLION"))
+        agent_prefix = agent.agent_id.upper().replace("-", "_")
+        provider_prefix = re.sub(r"[^A-Z0-9]+", "_", agent.provider.upper()).strip("_")
+        model_prefix = re.sub(r"[^A-Z0-9]+", "_", agent.model.upper()).strip("_")
+
+        def rate(kind: str) -> str | None:
+            names = [
+                f"{agent_prefix}_{kind}_COST_PER_MILLION",
+                f"MODEL_{model_prefix}_{kind}_COST_PER_MILLION",
+                f"PROVIDER_{provider_prefix}_{kind}_COST_PER_MILLION",
+                f"AGENT_{kind}_COST_PER_MILLION",
+            ]
+            return next((os.environ[name] for name in names if name in os.environ), None)
+
+        input_rate = rate("INPUT")
+        output_rate = rate("OUTPUT")
         if input_rate is None or output_rate is None:
             return None
         return input_tokens * float(input_rate) / 1_000_000 + output_tokens * float(output_rate) / 1_000_000

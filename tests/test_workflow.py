@@ -330,12 +330,44 @@ class WorkflowTest(unittest.TestCase):
             self.assertEqual(len(payloads), 5)
             for payload in payloads:
                 metrics = payload["metrics"]
+                self.assertEqual(metrics["provider"], "mock")
+                self.assertEqual(metrics["model"], "mock-v1")
                 self.assertGreaterEqual(metrics["duration_seconds"], 0)
                 self.assertEqual(metrics["input_tokens"], 100)
                 self.assertEqual(metrics["output_tokens"], 25)
                 self.assertEqual(metrics["retries"], 0)
                 self.assertEqual(metrics["repairs"], 0)
                 self.assertAlmostEqual(metrics["estimated_cost_usd"], 0.0004)
+
+    def test_cost_rate_precedence(self):
+        agent = AgentSpec("reviewer", "reviewer", "anthropic", "claude-sonnet-4-6", "system")
+        with patch.dict("os.environ", {
+            "AGENT_INPUT_COST_PER_MILLION": "1",
+            "AGENT_OUTPUT_COST_PER_MILLION": "1",
+            "PROVIDER_ANTHROPIC_INPUT_COST_PER_MILLION": "2",
+            "PROVIDER_ANTHROPIC_OUTPUT_COST_PER_MILLION": "2",
+            "MODEL_CLAUDE_SONNET_4_6_INPUT_COST_PER_MILLION": "3",
+            "MODEL_CLAUDE_SONNET_4_6_OUTPUT_COST_PER_MILLION": "3",
+            "REVIEWER_INPUT_COST_PER_MILLION": "4",
+            "REVIEWER_OUTPUT_COST_PER_MILLION": "4",
+        }, clear=True):
+            self.assertAlmostEqual(
+                CollaborationWorkflow._estimated_cost(agent, 1_000_000, 1_000_000),
+                8.0,
+            )
+
+    def test_provider_cost_rate_falls_back_before_global(self):
+        agent = AgentSpec("reviewer", "reviewer", "anthropic", "claude-sonnet-4-6", "system")
+        with patch.dict("os.environ", {
+            "AGENT_INPUT_COST_PER_MILLION": "1",
+            "AGENT_OUTPUT_COST_PER_MILLION": "1",
+            "PROVIDER_ANTHROPIC_INPUT_COST_PER_MILLION": "2",
+            "PROVIDER_ANTHROPIC_OUTPUT_COST_PER_MILLION": "3",
+        }, clear=True):
+            self.assertAlmostEqual(
+                CollaborationWorkflow._estimated_cost(agent, 1_000_000, 1_000_000),
+                5.0,
+            )
 
 
 if __name__ == "__main__":
