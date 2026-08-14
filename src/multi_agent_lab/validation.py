@@ -8,6 +8,39 @@ class OutputValidationError(ValueError):
     pass
 
 
+def schema_for_role(role: str) -> dict[str, Any]:
+    string_list = {"type": "array", "items": {"type": "string"}}
+    confidence = {"type": "number", "minimum": 0, "maximum": 1}
+    if role == "producer":
+        properties = {
+            "proposal": {"type": "string"},
+            "assumptions": string_list,
+            "risks": string_list,
+            "confidence": confidence,
+        }
+    elif role == "critic":
+        properties = {
+            "findings": string_list,
+            "recommendation": {"type": "string", "enum": ["approve", "revise", "reject"]},
+            "confidence": confidence,
+        }
+    elif role == "reviewer":
+        properties = {
+            "decision": {"type": "string"},
+            "final": {"type": "string"},
+            "unresolved_questions": string_list,
+            "confidence": confidence,
+        }
+    else:
+        raise OutputValidationError(f"unknown agent role {role!r}")
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
 def _extract_json(text: str) -> dict[str, Any]:
     candidate = text.strip()
     if candidate.startswith("```"):

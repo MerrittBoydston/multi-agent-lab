@@ -9,9 +9,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from multi_agent_lab.models import AgentSpec, CompletionResult
-from multi_agent_lab.providers import AnthropicProvider, MockProvider
+from multi_agent_lab.providers import AnthropicProvider, MockProvider, OpenAIProvider
 from multi_agent_lab.workflow import CollaborationWorkflow, WorkflowInterrupted
-from multi_agent_lab.validation import OutputValidationError, validate_output
+from multi_agent_lab.validation import OutputValidationError, schema_for_role, validate_output
 
 
 class WorkflowTest(unittest.TestCase):
@@ -183,11 +183,44 @@ class WorkflowTest(unittest.TestCase):
                 self.messages = FakeMessages()
 
         agent = AgentSpec("reviewer", "reviewer", "anthropic", "test-model", "system")
-        with patch("anthropic.AsyncAnthropic", return_value=FakeClient()):
+        client = FakeClient()
+        with patch("anthropic.AsyncAnthropic", return_value=client):
             result = asyncio.run(AnthropicProvider().complete(agent, "prompt"))
         self.assertEqual(result.content, "streamed response")
         self.assertEqual(result.input_tokens, 12)
         self.assertEqual(result.output_tokens, 3)
+        output_format = client.messages.kwargs["output_config"]["format"]
+        self.assertEqual(output_format["type"], "json_schema")
+        self.assertEqual(output_format["schema"], schema_for_role("reviewer"))
+
+    def test_openai_provider_uses_strict_structured_output(self):
+        class FakeResponses:
+            async def create(self, **kwargs):
+                self.kwargs = kwargs
+                return SimpleNamespace(
+                    output_text='{"findings":[],"recommendation":"approve","confidence":1}',
+                    usage=SimpleNamespace(input_tokens=10, output_tokens=4),
+                )
+
+        class FakeClient:
+            def __init__(self):
+                self.responses = FakeResponses()
+
+        client = FakeClient()
+        agent = AgentSpec("critic-a", "critic", "openai", "test-model", "system")
+        with patch("openai.AsyncOpenAI", return_value=client):
+            result = asyncio.run(OpenAIProvider().complete(agent, "prompt"))
+        self.assertEqual(result.input_tokens, 10)
+        output_format = client.responses.kwargs["text"]["format"]
+        self.assertEqual(output_format["type"], "json_schema")
+        self.assertTrue(output_format["strict"])
+        self.assertEqual(output_format["schema"], schema_for_role("critic"))
+
+    def test_role_schemas_are_closed_and_fully_required(self):
+        for role in ("producer", "critic", "reviewer"):
+            schema = schema_for_role(role)
+            self.assertFalse(schema["additionalProperties"])
+            self.assertEqual(set(schema["required"]), set(schema["properties"]))
 
     def test_large_reviewer_input_is_compacted_and_audited(self):
         with tempfile.TemporaryDirectory() as folder, patch.dict("os.environ", {

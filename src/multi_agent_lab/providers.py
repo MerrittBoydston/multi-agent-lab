@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from .models import AgentSpec, CompletionResult
+from .validation import schema_for_role
 
 
 class AgentProvider(ABC):
@@ -62,6 +63,12 @@ class AnthropicProvider(AgentProvider):
             max_tokens=3000,
             system=agent.system_prompt,
             messages=[{"role": "user", "content": prompt}],
+            output_config={
+                "format": {
+                    "type": "json_schema",
+                    "schema": schema_for_role(agent.role),
+                }
+            },
         ) as stream:
             message = await stream.get_final_message()
         content = "".join(
@@ -78,6 +85,14 @@ class OpenAIProvider(AgentProvider):
             model=agent.model,
             instructions=agent.system_prompt,
             input=prompt,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": f"{agent.role}_output",
+                    "schema": schema_for_role(agent.role),
+                    "strict": True,
+                }
+            },
         )
         usage = response.usage
         return CompletionResult(
