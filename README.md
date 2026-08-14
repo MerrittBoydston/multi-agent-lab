@@ -1,5 +1,7 @@
 # Multi-Agent Lab
 
+The GitHub Actions workflow runs the offline test suite on Python 3.11 and 3.13 for every push to `main` and every pull request. Provider SDKs are installed for adapter contract tests, but CI does not use API keys or make model calls.
+
 A small local reference implementation of a controlled multi-agent environment:
 
 1. Two independent producers create proposals in parallel.
