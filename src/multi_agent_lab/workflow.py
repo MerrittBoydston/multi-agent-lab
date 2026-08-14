@@ -21,6 +21,14 @@ Return JSON with: findings[], recommendation (approve|revise|reject), confidence
 JUDGE_PROMPT = """You are an impartial synthesizer. Preserve important disagreements rather than forcing consensus.
 Return JSON with: decision, final, unresolved_questions[], confidence (0..1)."""
 
+ARTIFACT_SLOTS = (
+    ("proposal", "producer-a"),
+    ("proposal", "producer-b"),
+    ("critique", "critic-a"),
+    ("critique", "critic-b"),
+    ("final", "reviewer"),
+)
+
 
 @dataclass(frozen=True)
 class WorkflowResult:
@@ -45,6 +53,17 @@ class CollaborationWorkflow:
         self.reviewer_input_limit = int(os.getenv("REVIEWER_MAX_INPUT_CHARS", "16000"))
         if self.reviewer_input_limit < 1000:
             raise ValueError("REVIEWER_MAX_INPUT_CHARS must be at least 1000")
+
+    def resume_plan(self, run_id: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+        run, _, _ = self.store.run_details(run_id)
+        if run["status"] == "completed":
+            raise ValueError(f"Run {run_id!r} is already completed")
+        if run["status"] != "failed":
+            raise ValueError(f"Run {run_id!r} is {run['status']!r}, not failed")
+        completed = self.store.artifacts_for_run(run_id)
+        reused = [slot for slot in ARTIFACT_SLOTS if slot in completed]
+        missing = [slot for slot in ARTIFACT_SLOTS if slot not in completed]
+        return reused, missing
 
     def _agent(self, agent_id: str, role: str, prompt: str) -> AgentSpec:
         prefix = agent_id.upper().replace("-", "_")

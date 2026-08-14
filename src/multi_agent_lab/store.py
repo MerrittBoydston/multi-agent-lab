@@ -97,6 +97,14 @@ class RunStore:
                 "FROM runs ORDER BY created_at DESC"
             ).fetchall()
 
+    def failed_run_ids(self, *, newest_first: bool = False) -> list[str]:
+        order = "DESC" if newest_first else "ASC"
+        with self._connect() as db:
+            rows = db.execute(
+                f"SELECT run_id FROM runs WHERE status = 'failed' ORDER BY created_at {order}"
+            ).fetchall()
+        return [str(row["run_id"]) for row in rows]
+
     def run_details(self, run_id: str) -> tuple[sqlite3.Row, list[sqlite3.Row], list[sqlite3.Row]]:
         with self._connect() as db:
             run = db.execute(

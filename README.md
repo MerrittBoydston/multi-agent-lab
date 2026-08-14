@@ -38,6 +38,24 @@ Resuming keeps the original objective and run ID. It reuses every existing propo
 
 Pressing Ctrl-C marks the run as failed, preserves completed artifacts, and prints the exact command needed to resume it. Resume and artifact-reuse actions are also recorded in the event audit trail.
 
+Resume the newest failed run without looking up its ID:
+
+```bash
+PYTHONPATH=src python3 -m multi_agent_lab.cli \
+  --workspace .multi-agent-lab \
+  --resume-latest
+```
+
+Or retry every currently failed run sequentially, oldest first:
+
+```bash
+PYTHONPATH=src python3 -m multi_agent_lab.cli \
+  --workspace .multi-agent-lab \
+  --retry-failed
+```
+
+Before each recovery starts, the CLI previews which `stage/agent` artifacts will be reused and which missing stages will execute. `--retry-failed` takes a snapshot of failed runs at startup, continues after individual failures, and exits with an error summary if any remain unsuccessful. If there are no failed runs, `--retry-failed` exits successfully without doing work; `--resume-latest` reports an error.
+
 List all runs and their statuses without querying SQLite directly:
 
 ```bash

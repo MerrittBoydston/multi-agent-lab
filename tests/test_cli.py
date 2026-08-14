@@ -3,6 +3,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -69,6 +71,63 @@ class CliTest(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("Error: Run 'missing' does not exist", result.stderr)
             self.assertNotIn("Traceback", result.stderr)
+
+    def create_failed_run(self, workspace: Path, objective: str, completed_slots=()) -> str:
+        from multi_agent_lab.workflow import CollaborationWorkflow
+
+        workflow = CollaborationWorkflow(workspace)
+        run_id = workflow.store.create_run(objective)
+        for stage, author in completed_slots:
+            workflow.store.artifact(run_id, stage, author, "{}")
+        workflow.store.finish(run_id, "failed")
+        return run_id
+
+    def test_resume_latest_selects_newest_failed_run_and_prints_plan(self):
+        with tempfile.TemporaryDirectory() as folder:
+            workspace = Path(folder)
+            older = self.create_failed_run(workspace, "Older")
+            newer = self.create_failed_run(
+                workspace, "Newer", (("proposal", "producer-a"),)
+            )
+
+            result = self.run_cli(workspace, "--resume-latest")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"Resume plan for {newer}:", result.stderr)
+            self.assertIn("Reuse: proposal/producer-a", result.stderr)
+            self.assertIn("Execute: proposal/producer-b", result.stderr)
+            self.assertIn(f"Run: {newer}", result.stdout)
+            with closing(sqlite3.connect(workspace / "runs.db")) as db:
+                statuses = dict(db.execute("SELECT run_id, status FROM runs"))
+            self.assertEqual(statuses[older], "failed")
+            self.assertEqual(statuses[newer], "completed")
+
+    def test_retry_failed_resumes_all_oldest_first(self):
+        with tempfile.TemporaryDirectory() as folder:
+            workspace = Path(folder)
+            first = self.create_failed_run(workspace, "First")
+            second = self.create_failed_run(workspace, "Second")
+
+            result = self.run_cli(workspace, "--retry-failed")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertLess(result.stderr.index(first), result.stderr.index(second))
+            self.assertIn(f"Run: {first}", result.stdout)
+            self.assertIn(f"Run: {second}", result.stdout)
+            with closing(sqlite3.connect(workspace / "runs.db")) as db:
+                self.assertEqual(
+                    db.execute("SELECT COUNT(*) FROM runs WHERE status = 'failed'").fetchone()[0], 0
+                )
+
+    def test_automatic_resume_handles_empty_failed_set(self):
+        with tempfile.TemporaryDirectory() as folder:
+            workspace = Path(folder)
+            latest = self.run_cli(workspace, "--resume-latest")
+            retry_all = self.run_cli(workspace, "--retry-failed")
+            self.assertEqual(latest.returncode, 1)
+            self.assertIn("Error: No failed runs found", latest.stderr)
+            self.assertEqual(retry_all.returncode, 0)
+            self.assertEqual(retry_all.stdout, "No failed runs found.\n")
 
     def test_timing_metrics_exclude_failed_to_resumed_downtime(self):
         start = datetime(2026, 1, 1, tzinfo=UTC)

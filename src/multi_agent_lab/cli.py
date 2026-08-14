@@ -108,18 +108,52 @@ def _show_run(workflow: CollaborationWorkflow, run_id: str) -> None:
         print(f"  {event['created_at']}  {event['stage']}{actor}  {event['event_type']}{detail}")
 
 
+def _print_resume_plan(workflow: CollaborationWorkflow, run_id: str) -> None:
+    reused, missing = workflow.resume_plan(run_id)
+    format_slots = lambda slots: ", ".join(f"{stage}/{agent}" for stage, agent in slots) or "none"
+    print(f"Resume plan for {run_id}:", file=sys.stderr)
+    print(f"  Reuse: {format_slots(reused)}", file=sys.stderr)
+    print(f"  Execute: {format_slots(missing)}", file=sys.stderr)
+
+
+async def _resume_many(workflow: CollaborationWorkflow, run_ids: list[str]) -> list[WorkflowResult]:
+    results = []
+    failures = []
+    for run_id in run_ids:
+        _print_resume_plan(workflow, run_id)
+        try:
+            results.append(await workflow.run(resume_id=run_id))
+        except WorkflowInterrupted:
+            raise
+        except Exception as exc:
+            failures.append((run_id, exc))
+            print(f"Error resuming {run_id}: {exc}", file=sys.stderr)
+    if failures:
+        failed_ids = ", ".join(run_id for run_id, _ in failures)
+        raise RuntimeError(f"Failed to resume {len(failures)} run(s): {failed_ids}")
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a controlled multi-agent collaboration")
     parser.add_argument("objective", nargs="?", help="The topic or deliverable to work on")
     parser.add_argument("--workspace", type=Path, default=Path(".multi-agent-lab"))
     parser.add_argument("--resume", metavar="RUN_ID", help="Resume a failed run, executing only missing stages")
+    parser.add_argument("--resume-latest", action="store_true", help="Resume the newest failed run")
+    parser.add_argument("--retry-failed", action="store_true", help="Resume all failed runs, oldest first")
     parser.add_argument("--list-runs", action="store_true", help="List runs in the workspace")
     parser.add_argument("--show-run", metavar="RUN_ID", help="Show a run's artifacts and audit events")
     args = parser.parse_args()
 
-    selected = sum((bool(args.objective), bool(args.resume), args.list_runs, bool(args.show_run)))
+    selected = sum((
+        bool(args.objective), bool(args.resume), args.resume_latest, args.retry_failed,
+        args.list_runs, bool(args.show_run),
+    ))
     if selected != 1:
-        parser.error("provide exactly one of an objective, --resume RUN_ID, --list-runs, or --show-run RUN_ID")
+        parser.error(
+            "provide exactly one of an objective, --resume RUN_ID, --resume-latest, "
+            "--retry-failed, --list-runs, or --show-run RUN_ID"
+        )
 
     try:
         workflow = CollaborationWorkflow(args.workspace, progress=lambda message: print(message, file=sys.stderr, flush=True))
@@ -129,6 +163,23 @@ def main() -> None:
         if args.show_run:
             _show_run(workflow, args.show_run)
             return
+        if args.resume_latest:
+            failed = workflow.store.failed_run_ids(newest_first=True)
+            if not failed:
+                raise ValueError("No failed runs found")
+            args.resume = failed[0]
+        if args.retry_failed:
+            failed = workflow.store.failed_run_ids()
+            if not failed:
+                print("No failed runs found.")
+                return
+            results = asyncio.run(_resume_many(workflow, failed))
+            for result in results:
+                print(f"Run: {result.run_id}")
+                print(f"Final artifact: {result.final_artifact.path}")
+            return
+        if args.resume:
+            _print_resume_plan(workflow, args.resume)
         result = asyncio.run(workflow.run(args.objective, resume_id=args.resume))
     except WorkflowInterrupted as exc:
         print(f"\nRun {exc.run_id} was interrupted; completed artifacts were preserved.")
