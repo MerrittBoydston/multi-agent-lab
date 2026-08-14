@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -55,19 +56,29 @@ class CollaborationWorkflow:
         return AgentSpec(agent_id, role, provider, model, prompt)
 
     async def _call(self, run_id: str, stage: str, agent: AgentSpec, prompt: str) -> Artifact:
+        started_at = time.perf_counter()
+        retries = 0
+        repairs = 0
+        input_tokens = 0
+        output_tokens = 0
+        usage_reported = False
         self.progress(f"[{run_id}] {stage}: starting {agent.agent_id} ({agent.provider}/{agent.model})")
         self.store.event(run_id, stage, "agent_started", {"provider": agent.provider, "model": agent.model}, agent.agent_id)
         for attempt in range(self.max_retries + 1):
             try:
-                result = await bounded_completion(
+                completion = await bounded_completion(
                     provider_for(agent.provider), agent, prompt,
                     timeout_seconds=self.timeout, max_output_chars=self.max_output,
                 )
+                input_tokens += completion.input_tokens or 0
+                output_tokens += completion.output_tokens or 0
+                usage_reported = usage_reported or completion.input_tokens is not None or completion.output_tokens is not None
                 break
             except Exception as exc:
                 if attempt >= self.max_retries or not self._is_transient(exc):
                     raise
                 delay = self.retry_delay * (2 ** attempt)
+                retries += 1
                 self.store.event(
                     run_id,
                     stage,
@@ -87,22 +98,26 @@ class CollaborationWorkflow:
                 )
                 await asyncio.sleep(delay)
         try:
-            result = validate_output(agent.role, result)
+            result = validate_output(agent.role, completion.content)
         except OutputValidationError as exc:
+            repairs = 1
             self.store.event(run_id, stage, "output_repairing", {"error": str(exc)}, agent.agent_id)
             self.progress(f"[{run_id}] {stage}: repairing malformed output from {agent.agent_id}")
             repair_prompt = (
                 f"Your previous response failed validation: {exc}.\n"
                 "Return only a corrected JSON object matching your required schema. "
                 "Do not use Markdown fences. Preserve the substance of the response.\n\n"
-                f"PREVIOUS RESPONSE:\n{result}"
+                f"PREVIOUS RESPONSE:\n{completion.content}"
             )
             repaired = await bounded_completion(
                 provider_for(agent.provider), agent, repair_prompt,
                 timeout_seconds=self.timeout, max_output_chars=self.max_output,
             )
+            input_tokens += repaired.input_tokens or 0
+            output_tokens += repaired.output_tokens or 0
+            usage_reported = usage_reported or repaired.input_tokens is not None or repaired.output_tokens is not None
             try:
-                result = validate_output(agent.role, repaired)
+                result = validate_output(agent.role, repaired.content)
             except OutputValidationError as repair_exc:
                 self.store.event(
                     run_id, stage, "output_repair_failed", {"error": str(repair_exc)}, agent.agent_id
@@ -112,9 +127,32 @@ class CollaborationWorkflow:
                 ) from repair_exc
             self.store.event(run_id, stage, "output_repaired", {}, agent.agent_id)
         artifact = self.store.artifact(run_id, stage, agent.agent_id, result)
-        self.store.event(run_id, stage, "agent_completed", {"artifact_id": artifact.artifact_id}, agent.agent_id)
+        duration = time.perf_counter() - started_at
+        metrics = {
+            "duration_seconds": round(duration, 6),
+            "retries": retries,
+            "repairs": repairs,
+            "input_tokens": input_tokens if usage_reported else None,
+            "output_tokens": output_tokens if usage_reported else None,
+        }
+        estimated_cost = self._estimated_cost(agent, input_tokens, output_tokens) if usage_reported else None
+        if estimated_cost is not None:
+            metrics["estimated_cost_usd"] = round(estimated_cost, 8)
+        self.store.event(
+            run_id, stage, "agent_completed",
+            {"artifact_id": artifact.artifact_id, "metrics": metrics}, agent.agent_id,
+        )
         self.progress(f"[{run_id}] {stage}: completed {agent.agent_id}")
         return artifact
+
+    @staticmethod
+    def _estimated_cost(agent: AgentSpec, input_tokens: int, output_tokens: int) -> float | None:
+        prefix = agent.agent_id.upper().replace("-", "_")
+        input_rate = os.getenv(f"{prefix}_INPUT_COST_PER_MILLION", os.getenv("AGENT_INPUT_COST_PER_MILLION"))
+        output_rate = os.getenv(f"{prefix}_OUTPUT_COST_PER_MILLION", os.getenv("AGENT_OUTPUT_COST_PER_MILLION"))
+        if input_rate is None or output_rate is None:
+            return None
+        return input_tokens * float(input_rate) / 1_000_000 + output_tokens * float(output_rate) / 1_000_000
 
     @staticmethod
     def _is_transient(exc: Exception) -> bool:

@@ -5,9 +5,10 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from multi_agent_lab.models import AgentSpec
+from multi_agent_lab.models import AgentSpec, CompletionResult
 from multi_agent_lab.providers import AnthropicProvider, MockProvider
 from multi_agent_lab.workflow import CollaborationWorkflow, WorkflowInterrupted
 from multi_agent_lab.validation import OutputValidationError, validate_output
@@ -166,8 +167,11 @@ class WorkflowTest(unittest.TestCase):
             async def __aexit__(self, *args):
                 return None
 
-            async def get_final_text(self):
-                return "streamed response"
+            async def get_final_message(self):
+                return SimpleNamespace(
+                    content=[SimpleNamespace(type="text", text="streamed response")],
+                    usage=SimpleNamespace(input_tokens=12, output_tokens=3),
+                )
 
         class FakeMessages:
             def stream(self, **kwargs):
@@ -181,7 +185,9 @@ class WorkflowTest(unittest.TestCase):
         agent = AgentSpec("reviewer", "reviewer", "anthropic", "test-model", "system")
         with patch("anthropic.AsyncAnthropic", return_value=FakeClient()):
             result = asyncio.run(AnthropicProvider().complete(agent, "prompt"))
-        self.assertEqual(result, "streamed response")
+        self.assertEqual(result.content, "streamed response")
+        self.assertEqual(result.input_tokens, 12)
+        self.assertEqual(result.output_tokens, 3)
 
     def test_large_reviewer_input_is_compacted_and_audited(self):
         with tempfile.TemporaryDirectory() as folder, patch.dict("os.environ", {
@@ -298,6 +304,38 @@ class WorkflowTest(unittest.TestCase):
                 "reviewer",
                 '{"decision":"merge","final":"x","unresolved_questions":[],"confidence":2}',
             )
+
+    def test_completed_events_include_usage_latency_and_cost(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict("os.environ", {
+            "AGENT_PROVIDER": "mock",
+            "AGENT_INPUT_COST_PER_MILLION": "2",
+            "AGENT_OUTPUT_COST_PER_MILLION": "8",
+        }):
+            workspace = Path(folder)
+            workflow = CollaborationWorkflow(workspace)
+            original_complete = MockProvider.complete
+
+            async def with_usage(provider, agent, prompt):
+                result = await original_complete(provider, agent, prompt)
+                return CompletionResult(result.content, input_tokens=100, output_tokens=25)
+
+            with patch.object(MockProvider, "complete", with_usage):
+                result = asyncio.run(workflow.run("Measure this run"))
+
+            with closing(sqlite3.connect(workspace / "runs.db")) as db:
+                payloads = [json.loads(row[0]) for row in db.execute(
+                    "SELECT payload_json FROM events WHERE run_id = ? AND event_type = 'agent_completed'",
+                    (result.run_id,),
+                )]
+            self.assertEqual(len(payloads), 5)
+            for payload in payloads:
+                metrics = payload["metrics"]
+                self.assertGreaterEqual(metrics["duration_seconds"], 0)
+                self.assertEqual(metrics["input_tokens"], 100)
+                self.assertEqual(metrics["output_tokens"], 25)
+                self.assertEqual(metrics["retries"], 0)
+                self.assertEqual(metrics["repairs"], 0)
+                self.assertAlmostEqual(metrics["estimated_cost_usd"], 0.0004)
 
 
 if __name__ == "__main__":

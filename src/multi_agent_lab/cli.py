@@ -21,11 +21,33 @@ def _print_runs(workflow: CollaborationWorkflow) -> None:
 
 def _show_run(workflow: CollaborationWorkflow, run_id: str) -> None:
     run, artifacts, events = workflow.store.run_details(run_id)
+    completed_metrics = []
+    for event in events:
+        if event["event_type"] == "agent_completed":
+            metrics = json.loads(event["payload_json"]).get("metrics")
+            if metrics:
+                completed_metrics.append(metrics)
     print(f"Run: {run['run_id']}")
     print(f"Status: {run['status']}")
     print(f"Created: {run['created_at']}")
     print(f"Completed: {run['completed_at'] or '-'}")
     print(f"Objective: {run['objective']}")
+    if completed_metrics:
+        duration = sum(item["duration_seconds"] for item in completed_metrics)
+        retries = sum(item["retries"] for item in completed_metrics)
+        repairs = sum(item["repairs"] for item in completed_metrics)
+        token_metrics = [item for item in completed_metrics if item["input_tokens"] is not None]
+        print("\nMetrics:")
+        print(f"  Agent time: {duration:.3f}s")
+        print(f"  Retries: {retries}")
+        print(f"  Repairs: {repairs}")
+        if token_metrics:
+            print(f"  Input tokens: {sum(item['input_tokens'] for item in token_metrics)}")
+            print(f"  Output tokens: {sum(item['output_tokens'] for item in token_metrics)}")
+            print(f"  Token coverage: {len(token_metrics)}/{len(completed_metrics)} agents")
+        costs = [item.get("estimated_cost_usd") for item in completed_metrics]
+        if costs and all(cost is not None for cost in costs):
+            print(f"  Estimated cost: ${sum(costs):.6f}")
     print("\nArtifacts:")
     if not artifacts:
         print("  None")

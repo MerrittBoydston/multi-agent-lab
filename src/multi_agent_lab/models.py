@@ -27,6 +27,12 @@ class Artifact:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class CompletionResult:
+    content: str
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
-

@@ -64,6 +64,8 @@ Reviewer inputs are capped at 16,000 characters by default. If proposals and cri
 
 Every agent response is validated as JSON against its role contract before it becomes an artifact. Malformed output receives one bounded repair attempt. Repair attempts and outcomes are recorded as `output_repairing`, `output_repaired`, or `output_repair_failed` events; a second invalid response fails the run without saving it.
 
+Completed-agent events include latency, retry and repair counts, and provider-reported token usage. `--show-run` aggregates these metrics. Optional cost estimates use `AGENT_INPUT_COST_PER_MILLION` and `AGENT_OUTPUT_COST_PER_MILLION`, with per-agent overrides such as `REVIEWER_INPUT_COST_PER_MILLION`; prices are intentionally configuration rather than hard-coded data.
+
 ## Step 2 — connect one real provider
 
 Create and activate a virtual environment, then install one adapter:
@@ -131,7 +133,7 @@ Model names change. Use models currently enabled for your provider accounts.
 Once the local workflow is useful, add in this order:
 
 1. A human approval state before external actions.
-2. OpenTelemetry-compatible traces and token/cost accounting.
+2. OpenTelemetry-compatible trace export.
 3. A remote-agent adapter using an A2A-style task and artifact contract.
 4. A durable workflow runtime only when runs need to survive process restarts.
 5. MCP servers for narrowly permissioned tools and shared data.
