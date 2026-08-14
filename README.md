@@ -79,6 +79,33 @@ PYTHONPATH=src python3 -m multi_agent_lab.cli \
   --show-run RUN_ID
 ```
 
+## Export, import, and report on runs
+
+Move or archive a complete run—including its configuration snapshot, controls,
+metrics, audit events, and artifacts—as a checksummed ZIP bundle:
+
+```bash
+multi-agent-lab --workspace .multi-agent-lab --export-run RUN_ID
+multi-agent-lab --workspace another-workspace --import-run RUN_ID.multi-agent-lab.zip
+```
+
+Use `--output PATH` with `--export-run` to choose the bundle location. Import
+verifies the bundle schema, manifest and artifact SHA-256 checksums, UTF-8
+content, IDs, artifact slots, declared members, safe archive paths, and bounded
+uncompressed size before writing anything. Existing run or artifact IDs are
+never overwritten. Checksums provide integrity detection, not proof of who
+created a bundle; only import bundles from sources you trust.
+
+Generate a portable Markdown summary on stdout, or save it to a new file:
+
+```bash
+multi-agent-lab --workspace .multi-agent-lab --report RUN_ID
+multi-agent-lab --workspace .multi-agent-lab --report RUN_ID --output run-report.md
+```
+
+Bundle schema version 1 is explicit in `manifest.json`; incompatible future
+schemas are rejected instead of being imported ambiguously.
+
 During execution, stage starts, completions, reused artifacts, compaction, and retries are printed to stderr. Errors are reported concisely without a Python traceback and failed resumes print a reusable resume command.
 
 The database enforces at most one artifact for each run, stage, and agent.

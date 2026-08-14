@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .config import WorkflowConfig, load_config
+from .portability import export_run, import_run, markdown_report
 from .workflow import CollaborationWorkflow, WorkflowInterrupted
 
 
@@ -168,6 +169,10 @@ def main() -> None:
     parser.add_argument("--list-runs", action="store_true", help="List runs in the workspace")
     parser.add_argument("--show-run", metavar="RUN_ID", help="Show a run's artifacts and audit events")
     parser.add_argument("--cancel", metavar="RUN_ID", help="Request cancellation of a resumable run")
+    parser.add_argument("--export-run", metavar="RUN_ID", help="Export a self-contained, checksummed run bundle")
+    parser.add_argument("--import-run", metavar="PATH", type=Path, help="Import a checksummed run bundle")
+    parser.add_argument("--report", metavar="RUN_ID", help="Generate a Markdown run summary")
+    parser.add_argument("--output", type=Path, help="Output path for --export-run or --report")
     parser.add_argument("--max-tokens", type=int, help="Maximum reserved and consumed tokens")
     parser.add_argument("--max-cost", type=float, help="Maximum estimated cost in USD")
     parser.add_argument("--deadline", help="Absolute ISO-8601 UTC deadline")
@@ -176,12 +181,16 @@ def main() -> None:
     selected = sum((
         bool(args.objective), bool(args.resume), args.resume_latest, args.retry_failed,
         args.list_runs, bool(args.show_run), args.dry_run, bool(args.cancel),
+        bool(args.export_run), bool(args.import_run), bool(args.report),
     ))
     if selected != 1:
         parser.error(
             "provide exactly one of an objective, --resume RUN_ID, --resume-latest, "
-            "--retry-failed, --list-runs, --show-run RUN_ID, --cancel RUN_ID, or --dry-run"
+            "--retry-failed, --list-runs, --show-run RUN_ID, --cancel RUN_ID, "
+            "--export-run RUN_ID, --import-run PATH, --report RUN_ID, or --dry-run"
         )
+    if args.output and not (args.export_run or args.report):
+        parser.error("--output can only be used with --export-run or --report")
     if args.max_tokens is not None and args.max_tokens <= 0:
         parser.error("--max-tokens must be positive")
     if args.max_cost is not None and args.max_cost <= 0:
@@ -203,6 +212,26 @@ def main() -> None:
         workflow = CollaborationWorkflow(args.workspace, progress=lambda message: print(message, file=sys.stderr, flush=True))
         config = load_config(args.config) if args.config else None
         controls = {"max_tokens": args.max_tokens, "max_cost": args.max_cost, "deadline": args.deadline}
+        if args.export_run:
+            path = export_run(workflow.store, args.export_run, args.output)
+            print(f"Exported run: {args.export_run}")
+            print(f"Bundle: {path}")
+            return
+        if args.import_run:
+            run_id = import_run(workflow.store, args.import_run)
+            print(f"Imported run: {run_id}")
+            return
+        if args.report:
+            report = markdown_report(workflow.store, args.report)
+            if args.output:
+                if args.output.exists():
+                    raise ValueError(f"Output path already exists: {args.output}")
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                args.output.write_text(report, encoding="utf-8")
+                print(f"Report: {args.output}")
+            else:
+                print(report, end="")
+            return
         if args.cancel:
             workflow.store.cancel(args.cancel)
             print(f"Cancelled run: {args.cancel}")

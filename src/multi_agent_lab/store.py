@@ -202,6 +202,73 @@ class RunStore:
             ).fetchall()
         return run, artifacts, events
 
+    def export_snapshot(self, run_id: str) -> tuple[dict, list[dict], list[dict]]:
+        """Return all durable metadata needed to recreate a run."""
+        with self._connect() as db:
+            run = db.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if run is None:
+                raise ValueError(f"Run {run_id!r} does not exist")
+            artifacts = db.execute(
+                "SELECT artifact_id, run_id, stage, author, path, created_at FROM artifacts "
+                "WHERE run_id = ? ORDER BY created_at, artifact_id", (run_id,)
+            ).fetchall()
+            events = db.execute(
+                "SELECT stage, agent_id, event_type, payload_json, created_at FROM events "
+                "WHERE run_id = ? ORDER BY event_id", (run_id,)
+            ).fetchall()
+        return dict(run), [dict(row) for row in artifacts], [dict(row) for row in events]
+
+    def import_snapshot(self, run: dict, artifacts: list[dict], events: list[dict], contents: dict[str, str]) -> None:
+        """Atomically register validated bundle metadata and its artifact contents."""
+        run_id = run["run_id"]
+        folder = self.artifact_root / run_id
+        written: list[Path] = []
+        try:
+            with self._connect() as db:
+                if db.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone():
+                    raise ValueError(f"Run {run_id!r} already exists")
+                artifact_ids = [artifact["artifact_id"] for artifact in artifacts]
+                if artifact_ids:
+                    placeholders = ",".join("?" for _ in artifact_ids)
+                    if db.execute(
+                        f"SELECT 1 FROM artifacts WHERE artifact_id IN ({placeholders}) LIMIT 1", artifact_ids
+                    ).fetchone():
+                        raise ValueError("An imported artifact ID already exists")
+                folder.mkdir(parents=True, exist_ok=False)
+                for artifact in artifacts:
+                    path = folder / f"{artifact['stage']}-{artifact['author']}-{artifact['artifact_id']}.md"
+                    path.write_text(contents[artifact["artifact_id"]], encoding="utf-8")
+                    written.append(path)
+                    artifact["path"] = str(path)
+                columns = (
+                    "run_id", "objective", "status", "created_at", "completed_at", "config_json",
+                    "max_tokens", "max_cost", "deadline", "used_tokens", "used_cost",
+                    "reserved_tokens", "reserved_cost", "cancel_requested",
+                )
+                db.execute(
+                    f"INSERT INTO runs ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                    tuple(run.get(column) for column in columns),
+                )
+                db.executemany(
+                    "INSERT INTO artifacts (artifact_id,run_id,stage,author,path,created_at) VALUES (?,?,?,?,?,?)",
+                    [tuple(artifact[name] for name in ("artifact_id", "run_id", "stage", "author", "path", "created_at"))
+                     for artifact in artifacts],
+                )
+                db.executemany(
+                    "INSERT INTO events (run_id,stage,agent_id,event_type,payload_json,created_at) VALUES (?,?,?,?,?,?)",
+                    [(run_id,) + tuple(event[name] for name in
+                     ("stage", "agent_id", "event_type", "payload_json", "created_at")) for event in events],
+                )
+        except Exception:
+            for path in written:
+                path.unlink(missing_ok=True)
+            if folder.exists():
+                try:
+                    folder.rmdir()
+                except OSError:
+                    pass
+            raise
+
     def artifacts_for_run(self, run_id: str) -> dict[tuple[str, str], Artifact]:
         with self._connect() as db:
             rows = db.execute(
